@@ -92,7 +92,7 @@ Analyze:
 - MITM attacks
 - Packet interception
 - Replay attacks
-
+Other:
 - Verify encryption effectiveness
 - Document weaknesses
 - Suggest mitigations
@@ -107,7 +107,7 @@ Test:
 - Multiple users
 - Multiple sessions
 - Network interruptions
-
+Other:
 - Fix bugs
 - Improve UI/UX
 - Add logging/debug tools
