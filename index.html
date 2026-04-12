@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="stylesheet" href="/src/styles.css" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>WireTalk - P2P Chat</title>
+    <script type="module" src="/src/main.ts" defer></script>
+  </head>
+
+  <body>
+    <main class="container">
+      <header class="header">
+        <h1>WireTalk P2P</h1>
+        <div class="connection-status" id="connection-status">
+          <div class="status-indicator" id="status-indicator"></div>
+          <span id="status-text">Disconnected</span>
+        </div>
+      </header>
+
+      <div class="chat-container">
+        <aside class="sidebar">
+          <div class="user-setup">
+            <h3>P2P Network Setup</h3>
+            <div class="form-group">
+              <input 
+                id="username-input" 
+                placeholder="Enter your username..."
+                maxlength="20"
+              />
+              <button id="set-username-btn" type="button">Set Username</button>
+            </div>
+            <button id="join-network-btn" type="button" disabled>Join P2P Network</button>
+            <div id="peer-info" class="peer-info" style="display: none;">
+              <h4>Your Peer ID:</h4>
+              <code id="peer-id-display"></code>
+            </div>
+          </div>
+          
+          <div class="peers-section">
+            <h3>Connected Peers (<span id="peer-count">0</span>)</h3>
+            <ul id="peers-list" class="peers-list"></ul>
+          </div>
+        </aside>
+
+        <div class="chat-main">
+          <div class="messages-container" id="messages-container">
+            <div class="welcome-message">
+              <p>Welcome to WireTalk P2P!</p>
+              <p>Set your username and join the network to start chatting with peers.</p>
+              <p><strong>No servers needed!</strong> Your messages are sent directly peer-to-peer.</p>
+            </div>
+          </div>
+          
+          <form class="message-form" id="message-form">
+            <div class="message-input-container">
+              <input 
+                id="message-input" 
+                placeholder="Type your message..." 
+                maxlength="500"
+                disabled
+              />
+              <button type="submit" id="send-btn" disabled>Send</button>
+            </div>
+          </form>
+        </div>
+      </div>
+    </main>
+  </body>
+</html>
