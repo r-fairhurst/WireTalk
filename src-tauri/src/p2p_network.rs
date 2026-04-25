@@ -5,7 +5,7 @@ use libp2p::{
 };
 use futures::StreamExt;
 use std::time::Duration;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use tokio::sync::mpsc;
 use anyhow::Result;
 
@@ -31,6 +31,9 @@ pub struct P2PNetwork {
 #[derive(Debug)]
 pub enum P2PCommand {
     SendMessage { content: String, username: String },
+    SendMessageToRoom { content: String, username: String, room_id: String },
+    JoinRoom { room_id: String },
+    LeaveRoom { room_id: String },
     UpdateUsername { username: String },
     GetPeers { respond_to: mpsc::UnboundedSender<Vec<User>> },
     Shutdown,
@@ -40,7 +43,7 @@ pub enum P2PCommand {
 pub enum P2PEvent {
     MessageReceived(Message),
     PeerJoined { peer_id: PeerId, username: Option<String> },
-    PeerLeft { peer_id: PeerId },
+    PeerLeft { peer_id: PeerId, username: String },
     PeerListUpdated { peers: Vec<User> },
 }
 
@@ -54,6 +57,7 @@ impl P2PNetwork {
         let local_peer_id = PeerId::from(local_key.public());
 
         // Create the swarm
+        let username_clone = username.clone();
         let mut swarm = SwarmBuilder::with_existing_identity(local_key)
             .with_tokio()
             .with_tcp(
@@ -61,7 +65,7 @@ impl P2PNetwork {
                 libp2p::noise::Config::new,
                 libp2p::yamux::Config::default,
             )?
-            .with_behaviour(|key| {
+            .with_behaviour(move |key| {
                 // Create gossipsub with message signing
                 let gossipsub_config = gossipsub::ConfigBuilder::default()
                     .heartbeat_interval(Duration::from_secs(1))
@@ -84,7 +88,7 @@ impl P2PNetwork {
                 let identify = identify::Behaviour::new(identify::Config::new(
                     "/wiretalk/1.0.0".to_string(),
                     key.public(),
-                ));
+                ).with_agent_version(username_clone));
 
                 // Create ping protocol
                 let ping = ping::Behaviour::new(ping::Config::new());
@@ -124,8 +128,9 @@ impl P2PNetwork {
         mut command_receiver: mpsc::UnboundedReceiver<P2PCommand>,
         event_sender: mpsc::UnboundedSender<P2PEvent>,
     ) {
-        let topic = gossipsub::IdentTopic::new("wiretalk-chat");
+        let default_topic = gossipsub::IdentTopic::new("wiretalk-chat");
         let mut connected_peers: HashMap<PeerId, User> = HashMap::new();
+        let mut subscribed_rooms: HashSet<String> = HashSet::new();
         
         loop {
             tokio::select! {
@@ -140,17 +145,58 @@ impl P2PNetwork {
                                 username,
                                 content,
                                 timestamp: chrono::Utc::now(),
+                                room_id: "default".to_string(),
                             };
                             
                             let message_json = serde_json::to_string(&message)
                                 .expect("Failed to serialize message");
                             
-                            if let Err(e) = swarm.behaviour_mut().gossipsub.publish(topic.clone(), message_json.as_bytes()) {
+                            if let Err(e) = swarm.behaviour_mut().gossipsub.publish(default_topic.clone(), message_json.as_bytes()) {
                                 tracing::error!("Failed to publish message: {}", e);
                             }
                         }
+                        Some(P2PCommand::SendMessageToRoom { content, username, room_id }) => {
+                            let message = Message {
+                                id: uuid::Uuid::new_v4().to_string(),
+                                username,
+                                content,
+                                timestamp: chrono::Utc::now(),
+                                room_id: room_id.clone(),
+                            };
+                            
+                            let message_json = serde_json::to_string(&message)
+                                .expect("Failed to serialize message");
+                            
+                            let room_topic = gossipsub::IdentTopic::new(format!("wiretalk-room-{}", room_id));
+                            if let Err(e) = swarm.behaviour_mut().gossipsub.publish(room_topic, message_json.as_bytes()) {
+                                tracing::error!("Failed to publish room message: {}", e);
+                            }
+                        }
+                        Some(P2PCommand::JoinRoom { room_id }) => {
+                            if !subscribed_rooms.contains(&room_id) {
+                                let room_topic = gossipsub::IdentTopic::new(format!("wiretalk-room-{}", room_id));
+                                if let Err(e) = swarm.behaviour_mut().gossipsub.subscribe(&room_topic) {
+                                    tracing::error!("Failed to subscribe to room {}: {}", room_id, e);
+                                } else {
+                                    subscribed_rooms.insert(room_id.clone());
+                                    tracing::info!("Joined room: {}", room_id);
+                                }
+                            }
+                        }
+                        Some(P2PCommand::LeaveRoom { room_id }) => {
+                            if subscribed_rooms.contains(&room_id) {
+                                let room_topic = gossipsub::IdentTopic::new(format!("wiretalk-room-{}", room_id));
+                                if let Err(e) = swarm.behaviour_mut().gossipsub.unsubscribe(&room_topic) {
+                                    tracing::error!("Failed to unsubscribe from room {}: {}", room_id, e);
+                                } else {
+                                    subscribed_rooms.remove(&room_id);
+                                    tracing::info!("Left room: {}", room_id);
+                                }
+                            }
+                        }
                         Some(P2PCommand::UpdateUsername { username: _ }) => {
-                            // Handle username updates
+                            // Username updates will be reflected in future messages
+                            // The identify behavior cannot be easily updated at runtime
                         }
                         Some(P2PCommand::GetPeers { respond_to }) => {
                             let peers: Vec<User> = connected_peers.values().cloned().collect();
@@ -204,20 +250,33 @@ impl P2PNetwork {
                 P2PNetworkBehaviourEvent::Mdns(mdns::Event::Discovered(list)) => {
                     // Handle discovered peers
                     for (peer_id, multiaddr) in list {
-                        tracing::info!("Discovered peer: {} at {}", peer_id, multiaddr);
+                        tracing::debug!("Discovered peer: {} at {}", peer_id, multiaddr);
                         let _ = swarm.dial(multiaddr);
                     }
                 }
                 P2PNetworkBehaviourEvent::Mdns(mdns::Event::Expired(list)) => {
                     // Handle expired peers
                     for (peer_id, _) in list {
-                        tracing::info!("Peer expired: {}", peer_id);
+                        tracing::debug!("Peer expired: {}", peer_id);
                     }
                 }
                 P2PNetworkBehaviourEvent::Identify(identify::Event::Received {
                     peer_id, info, ..
                 }) => {
-                    tracing::info!("Identified peer: {} with protocols: {:?}", peer_id, info.protocols);
+                    tracing::debug!("Identified peer: {} with protocols: {:?}", peer_id, info.protocols);
+                    
+                    // Update peer username from identify agent version
+                    if let Some(peer_info) = connected_peers.get_mut(&peer_id) {
+                        let username = info.agent_version.clone();
+                        if peer_info.username != username {
+                            tracing::info!("Updated peer {} username to: {}", peer_id, username);
+                            peer_info.username = username;
+                            
+                            // Send updated peer list
+                            let peers: Vec<User> = connected_peers.values().cloned().collect();
+                            let _ = event_sender.send(P2PEvent::PeerListUpdated { peers });
+                        }
+                    }
                 }
                 _ => {}
             }
@@ -225,33 +284,45 @@ impl P2PNetwork {
                 tracing::info!("Listening on {}", address);
             }
             SwarmEvent::ConnectionEstablished { peer_id, .. } => {
-                tracing::info!("Connected to peer: {}", peer_id);
+                // Only send peer joined event if this is the first connection to this peer
+                let is_new_peer = !connected_peers.contains_key(&peer_id);
                 
-                // Create a user entry for the connected peer
-                let user = User {
-                    id: peer_id.to_string(),
-                    username: format!("Peer_{}", &peer_id.to_string()[..8]),
-                    connected_at: chrono::Utc::now(),
-                };
-                
-                connected_peers.insert(peer_id, user.clone());
-                
-                let _ = event_sender.send(P2PEvent::PeerJoined { peer_id, username: Some(user.username) });
-                
-                // Send updated peer list
-                let peers: Vec<User> = connected_peers.values().cloned().collect();
-                let _ = event_sender.send(P2PEvent::PeerListUpdated { peers });
+                if is_new_peer {
+                    tracing::info!("New peer connected: {}", peer_id);
+                    
+                    // Create a user entry for the connected peer
+                    let user = User {
+                        id: peer_id.to_string(),
+                        username: format!("Peer_{}", &peer_id.to_string()[..8]),
+                        connected_at: chrono::Utc::now(),
+                    };
+                    
+                    connected_peers.insert(peer_id, user.clone());
+                    
+                    let _ = event_sender.send(P2PEvent::PeerJoined { peer_id, username: Some(user.username) });
+                    
+                    // Send updated peer list only when there's a new peer
+                    let peers: Vec<User> = connected_peers.values().cloned().collect();
+                    let _ = event_sender.send(P2PEvent::PeerListUpdated { peers });
+                } else {
+                    tracing::debug!("Additional connection established with existing peer: {}", peer_id);
+                }
             }
             SwarmEvent::ConnectionClosed { peer_id, .. } => {
-                tracing::info!("Disconnected from peer: {}", peer_id);
-                
-                connected_peers.remove(&peer_id);
-                
-                let _ = event_sender.send(P2PEvent::PeerLeft { peer_id });
-                
-                // Send updated peer list
-                let peers: Vec<User> = connected_peers.values().cloned().collect();
-                let _ = event_sender.send(P2PEvent::PeerListUpdated { peers });
+                // Only send peer left event if this peer was in our connected list
+                if let Some(user) = connected_peers.get(&peer_id) {
+                    let username = user.username.clone();
+                    tracing::info!("Peer disconnected: {}", peer_id);
+                    connected_peers.remove(&peer_id);
+                    
+                    let _ = event_sender.send(P2PEvent::PeerLeft { peer_id, username });
+                    
+                    // Send updated peer list
+                    let peers: Vec<User> = connected_peers.values().cloned().collect();
+                    let _ = event_sender.send(P2PEvent::PeerListUpdated { peers });
+                } else {
+                    tracing::debug!("Additional connection closed with peer: {}", peer_id);
+                }
             }
             _ => {}
         }
@@ -261,6 +332,31 @@ impl P2PNetwork {
         self.message_sender
             .send(P2PCommand::SendMessage { content, username })
             .map_err(|e| anyhow::anyhow!("Failed to send message command: {}", e))
+    }
+
+    pub async fn send_message_to_room(&self, content: String, username: String, room_id: String) -> Result<()> {
+        self.message_sender
+            .send(P2PCommand::SendMessageToRoom { content, username, room_id })
+            .map_err(|e| anyhow::anyhow!("Failed to send room message command: {}", e))
+    }
+
+    pub async fn join_room(&self, room_id: String) -> Result<()> {
+        self.message_sender
+            .send(P2PCommand::JoinRoom { room_id })
+            .map_err(|e| anyhow::anyhow!("Failed to send join room command: {}", e))
+    }
+
+    pub async fn leave_room(&self, room_id: String) -> Result<()> {
+        self.message_sender
+            .send(P2PCommand::LeaveRoom { room_id })
+            .map_err(|e| anyhow::anyhow!("Failed to send leave room command: {}", e))
+    }
+
+    pub async fn invite_to_room(&self, peer_id: PeerId, room_id: String) -> Result<()> {
+        // In a real implementation, you would send a direct message to the peer with the room invitation
+        // For simplicity, we will just log this action
+        tracing::info!("Inviting peer {} to room {}", peer_id, room_id);
+        Ok(())
     }
 
     pub async fn update_username(&self, username: String) -> Result<()> {

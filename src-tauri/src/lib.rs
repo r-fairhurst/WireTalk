@@ -15,6 +15,14 @@ pub struct Message {
     pub username: String,
     pub content: String,
     pub timestamp: DateTime<Utc>,
+    pub room_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Room {
+    pub id: String,
+    pub name: String,
+    pub created_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -29,6 +37,8 @@ pub struct AppState {
     pub p2p_network: Arc<Mutex<Option<P2PNetwork>>>,
     pub messages: Arc<Mutex<Vec<Message>>>,
     pub current_username: Arc<Mutex<Option<String>>>,
+    pub joined_rooms: Arc<Mutex<Vec<Room>>>,
+    pub current_room: Arc<Mutex<Option<String>>>,
 }
 
 impl AppState {
@@ -37,6 +47,8 @@ impl AppState {
             p2p_network: Arc::new(Mutex::new(None)),
             messages: Arc::new(Mutex::new(Vec::new())),
             current_username: Arc::new(Mutex::new(None)),
+            joined_rooms: Arc::new(Mutex::new(Vec::new())),
+            current_room: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -73,11 +85,21 @@ async fn start_p2p_network(
                 p2p_network::P2PEvent::MessageReceived(message) => {
                     let _ = app_clone.emit("message_received", &message);
                 }
-                p2p_network::P2PEvent::PeerJoined { peer_id, username: _ } => {
-                    let _ = app_clone.emit("peer_joined", &peer_id.to_string());
+                p2p_network::P2PEvent::PeerJoined { peer_id, username } => {
+                    let user = User {
+                        id: peer_id.to_string(),
+                        username: username.unwrap_or_else(|| "Anonymous".to_string()),
+                        connected_at: Utc::now(),
+                    };
+                    let _ = app_clone.emit("peer_joined", &user);
                 }
-                p2p_network::P2PEvent::PeerLeft { peer_id } => {
-                    let _ = app_clone.emit("peer_left", &peer_id.to_string());
+                p2p_network::P2PEvent::PeerLeft { peer_id, username } => {
+                    let user = User {
+                        id: peer_id.to_string(),
+                        username,
+                        connected_at: Utc::now(),
+                    };
+                    let _ = app_clone.emit("peer_left", &user);
                 }
                 p2p_network::P2PEvent::PeerListUpdated { peers } => {
                     let _ = app_clone.emit("peer_list_updated", &peers);
@@ -96,6 +118,7 @@ async fn start_p2p_network(
 #[tauri::command]
 async fn send_p2p_message(
     content: String,
+    room_id: Option<String>,
     state: State<'_, AppState>,
     app: AppHandle,
 ) -> Result<(), String> {
@@ -104,11 +127,22 @@ async fn send_p2p_message(
         username_lock.clone().unwrap_or_else(|| "Anonymous".to_string())
     };
 
+    let current_room = room_id.or_else(|| {
+        // Use current room if no room_id provided
+        futures::executor::block_on(async {
+            let current_room_lock = state.current_room.lock().await;
+            current_room_lock.clone()
+        })
+    });
+
+    let room_id = current_room.unwrap_or_else(|| "default".to_string());
+
     let message = Message {
         id: Uuid::new_v4().to_string(),
         username: username.clone(),
         content: content.clone(),
         timestamp: Utc::now(),
+        room_id: room_id.clone(),
     };
 
     // Store message locally
@@ -117,11 +151,11 @@ async fn send_p2p_message(
         messages.push(message.clone());
     }
 
-    // Send via P2P network
+    // Send via P2P network with room context
     {
         let p2p_lock = state.p2p_network.lock().await;
         if let Some(network) = &*p2p_lock {
-            network.send_message(content.clone(), username.clone()).await
+            network.send_message_to_room(content.clone(), username.clone(), room_id.clone()).await
                 .map_err(|e| format!("Failed to send P2P message: {}", e))?;
         } else {
             return Err("P2P network not initialized".to_string());
@@ -136,9 +170,184 @@ async fn send_p2p_message(
 }
 
 #[tauri::command]
-async fn get_messages(state: State<'_, AppState>) -> Result<Vec<Message>, String> {
+async fn create_room(
+    name: String,
+    state: State<'_, AppState>,
+    app: AppHandle,
+) -> Result<Room, String> {
+    let room = Room {
+        id: Uuid::new_v4().to_string(),
+        name: name.clone(),
+        created_at: Utc::now(),
+    };
+
+    // Add to joined rooms
+    {
+        let mut rooms_lock = state.joined_rooms.lock().await;
+        rooms_lock.push(room.clone());
+    }
+
+    // Set as current room
+    {
+        let mut current_room_lock = state.current_room.lock().await;
+        *current_room_lock = Some(room.id.clone());
+    }
+
+    // Subscribe to room topic in P2P network
+    {
+        let p2p_lock = state.p2p_network.lock().await;
+        if let Some(network) = &*p2p_lock {
+            network.join_room(room.id.clone()).await
+                .map_err(|e| format!("Failed to join room in P2P network: {}", e))?;
+        }
+    }
+
+    // Emit to frontend
+    app.emit("room_created", &room)
+        .map_err(|e| format!("Failed to emit room creation: {}", e))?;
+    
+    app.emit("room_joined", &room.id)
+        .map_err(|e| format!("Failed to emit room joined: {}", e))?;
+
+    Ok(room)
+}
+
+#[tauri::command]
+async fn join_room(
+    room_id: String,
+    state: State<'_, AppState>,
+    app: AppHandle,
+) -> Result<(), String> {
+    // Check if room is already joined
+    {
+        let rooms_lock = state.joined_rooms.lock().await;
+        if !rooms_lock.iter().any(|r| r.id == room_id) {
+            // Create room entry (for now, we'll assume the room exists)
+            let room = Room {
+                id: room_id.clone(),
+                name: format!("Room {}", &room_id[..8]),
+                created_at: Utc::now(),
+            };
+            drop(rooms_lock);
+            
+            let mut rooms_lock = state.joined_rooms.lock().await;
+            rooms_lock.push(room);
+        }
+    }
+
+    // Set as current room
+    {
+        let mut current_room_lock = state.current_room.lock().await;
+        *current_room_lock = Some(room_id.clone());
+    }
+
+    // Subscribe to room topic in P2P network
+    {
+        let p2p_lock = state.p2p_network.lock().await;
+        if let Some(network) = &*p2p_lock {
+            network.join_room(room_id.clone()).await
+                .map_err(|e| format!("Failed to join room in P2P network: {}", e))?;
+        }
+    }
+
+    // Emit to frontend
+    app.emit("room_joined", &room_id)
+        .map_err(|e| format!("Failed to emit room joined: {}", e))?;
+
+    Ok(())
+}
+
+#[tauri::command]
+async fn leave_room(
+    room_id: String,
+    state: State<'_, AppState>,
+    app: AppHandle,
+) -> Result<(), String> {
+    // Remove from joined rooms
+    {
+        let mut rooms_lock = state.joined_rooms.lock().await;
+        rooms_lock.retain(|r| r.id != room_id);
+    }
+
+    // Clear current room if it's the one being left
+    {
+        let mut current_room_lock = state.current_room.lock().await;
+        if let Some(current_id) = current_room_lock.as_ref() {
+            if current_id == &room_id {
+                *current_room_lock = None;
+            }
+        }
+    }
+
+    // Unsubscribe from room topic in P2P network
+    {
+        let p2p_lock = state.p2p_network.lock().await;
+        if let Some(network) = &*p2p_lock {
+            network.leave_room(room_id.clone()).await
+                .map_err(|e| format!("Failed to leave room in P2P network: {}", e))?;
+        }
+    }
+
+    // Emit to frontend
+    app.emit("room_left", &room_id)
+        .map_err(|e| format!("Failed to emit room left: {}", e))?;
+
+    Ok(())
+}
+
+#[tauri::command]
+async fn get_joined_rooms(state: State<'_, AppState>) -> Result<Vec<Room>, String> {
+    let rooms_lock = state.joined_rooms.lock().await;
+    Ok(rooms_lock.clone())
+}
+
+#[tauri::command]
+async fn get_current_room(state: State<'_, AppState>) -> Result<Option<String>, String> {
+    let current_room_lock = state.current_room.lock().await;
+    Ok(current_room_lock.clone())
+}
+
+#[tauri::command]
+async fn switch_room(
+    room_id: String,
+    state: State<'_, AppState>,
+    app: AppHandle,
+) -> Result<(), String> {
+    // Check if room is joined
+    {
+        let rooms_lock = state.joined_rooms.lock().await;
+        if !rooms_lock.iter().any(|r| r.id == room_id) {
+            return Err("Room not joined".to_string());
+        }
+    }
+
+    // Set as current room
+    {
+        let mut current_room_lock = state.current_room.lock().await;
+        *current_room_lock = Some(room_id.clone());
+    }
+
+    // Emit to frontend
+    app.emit("room_switched", &room_id)
+        .map_err(|e| format!("Failed to emit room switch: {}", e))?;
+
+    Ok(())
+}
+
+#[tauri::command]
+async fn get_messages(room_id: Option<String>, state: State<'_, AppState>) -> Result<Vec<Message>, String> {
     let messages = state.messages.lock().await;
-    Ok(messages.clone())
+    
+    match room_id {
+        Some(room) => {
+            // Filter messages by room
+            Ok(messages.iter().filter(|msg| msg.room_id == room).cloned().collect())
+        }
+        None => {
+            // Return all messages if no room specified
+            Ok(messages.clone())
+        }
+    }
 }
 
 #[tauri::command]
@@ -220,7 +429,13 @@ pub fn run() {
             get_messages,
             update_username,
             get_network_status,
-            get_connected_peers
+            get_connected_peers,
+            create_room,
+            join_room,
+            leave_room,
+            get_joined_rooms,
+            get_current_room,
+            switch_room
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

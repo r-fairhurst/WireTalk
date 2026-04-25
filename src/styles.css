@@ -7,8 +7,6 @@
 body {
   font-family: system-ui, sans-serif;
   font-size: 14px;
-  color: #333;
-  background: white;
   margin: 0;
   min-height: 100vh;
 }
@@ -20,9 +18,8 @@ body {
 }
 
 .header {
-  background: #ddd;
   padding: 1rem;
-  border-bottom: 1px solid #ccc;
+  border-bottom: 1px solid;
   display: flex;
   justify-content: space-between;
   align-items: center;
@@ -43,29 +40,29 @@ body {
 .status-indicator {
   width: 8px;
   height: 8px;
-  background-color: red;
 }
 
 .status-indicator.connected {
-  background-color: green;
 }
 
 .status-indicator.connecting {
-  background-color: orange;
 }
 
 .chat-container {
   flex: 1;
   display: flex;
+  height: calc(100vh - 80px); /* Account for header height */
+  min-height: 0; /* Allow flex items to shrink */
 }
 
 .sidebar {
   width: 250px;
-  background: #f5f5f5;
-  border-right: 1px solid #ddd;
+  border-right: 1px solid;
   display: flex;
   flex-direction: column;
+  height: 100%; /* Full height of chat-container */
   overflow-y: auto;
+  overflow-x: hidden;
 }
 
 .username-input {
@@ -74,7 +71,8 @@ body {
 
 .user-setup {
   padding: 1rem;
-  border-bottom: 1px solid #ddd;
+  border-bottom: 1px solid;
+  flex-shrink: 0;
 }
 
 .user-setup h3 {
@@ -89,6 +87,10 @@ body {
 .peers-section {
   flex: 1;
   padding: 1rem;
+  display: flex;
+  flex-direction: column;
+  min-height: 150px;
+  overflow-y: auto;
 }
 
 .peers-section h3 {
@@ -98,19 +100,37 @@ body {
 
 .peers-list {
   list-style: none;
+  flex: 1;
+  overflow-y: auto;
+  min-height: 0;
+  margin-bottom: 0;
+  max-height: 200px;
+}
+
+/* Peer actions container */
+.peer-actions {
+  margin-top: 0.5rem;
+  padding-top: 0.5rem;
+  border-top: 1px solid;
+  flex-shrink: 0;
+  position: relative;
+}
+
+.peer-actions .small-btn {
+  width: 100%;
+  justify-content: center;
 }
 
 .peers-list li {
   padding: 0.25rem 0;
   font-size: 0.9rem;
-  border-bottom: 1px solid #eee;
+  border-bottom: 1px solid;
 }
 
 .peer-info {
   margin-top: 1rem;
   padding: 0.5rem;
-  background: #eee;
-  border: 1px solid #ddd;
+  border: 1px solid;
 }
 
 .peer-info h4 {
@@ -121,8 +141,7 @@ body {
 .peer-info code {
   display: block;
   padding: 0.25rem;
-  background: white;
-  border: 1px solid #ccc;
+  border: 1px solid;
   font-size: 0.8rem;
   word-break: break-all;
 }
@@ -131,40 +150,39 @@ body {
   flex: 1;
   display: flex;
   flex-direction: column;
-  background: white;
+  height: 100%; /* Full height of chat-container */
+  min-width: 0; /* Allow content to shrink */
 }
 
 .messages-container {
   flex: 1;
   padding: 1rem;
   overflow-y: auto;
-  background: #fafafa;
+  overflow-x: hidden;
+  min-height: 0; /* Allow flex item to shrink */
+  max-height: 100%; /* Prevent overflow beyond container */
 }
 
 .welcome-message {
   text-align: center;
   padding: 2rem;
-  color: #666;
   font-style: italic;
 }
 
 .message {
   margin-bottom: 0.5rem;
   padding: 0.5rem;
-  background: white;
-  border: 1px solid #ddd;
-  border-left: 3px solid #333;
+  border: 1px solid;
+  border-left: 3px solid;
 }
 
 .message.own {
-  background: #f0f0f0;
-  border-left-color: #666;
+  border-left: 3px solid;
   margin-left: 2rem;
 }
 
 .message.system {
-  background: #e6f3ff;
-  border-left-color: #0066cc;
+  border-left: 3px solid;
   font-style: italic;
   text-align: center;
 }
@@ -174,7 +192,6 @@ body {
   justify-content: space-between;
   margin-bottom: 0.25rem;
   font-size: 0.8rem;
-  opacity: 0.7;
 }
 
 .message-username {
@@ -191,8 +208,8 @@ body {
 
 .message-form {
   padding: 1rem;
-  background: #f5f5f5;
-  border-top: 1px solid #ddd;
+  border-top: 1px solid;
+  flex-shrink: 0; /* Prevent form from shrinking */
 }
 
 .message-input-container {
@@ -240,14 +257,163 @@ button:disabled {
 }
 
 a:hover {
-  color: #24c8db;
 }
 
 input,
 button {
-  color: #ffffff;
-  background-color: #0f0f0f98;
 }
 button:active {
-  background-color: #0f0f0f69;
+}
+
+/* Room-related styles */
+.rooms-section {
+  padding: 1rem;
+  border-bottom: 1px solid;
+  display: flex;
+  flex-direction: column;
+  flex-shrink: 0;
+  max-height: 50vh;
+  overflow-y: auto;
+}
+
+.rooms-section h3 {
+  margin-bottom: 0.5rem;
+  font-size: 1rem;
+}
+
+.room-controls {
+  margin-bottom: 1rem;
+  flex-shrink: 0;
+}
+
+.room-controls .form-group {
+  margin-bottom: 0.5rem;
+}
+
+.current-room {
+  margin-bottom: 1rem;
+  padding: 0.5rem;
+  border: 1px solid;
+  flex-shrink: 0;
+}
+
+.current-room h4 {
+  margin: 0 0 0.5rem 0;
+  font-size: 0.9rem;
+}
+
+.current-room .room-info {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.current-room-actions {
+  display: flex;
+  gap: 0.25rem;
+}
+
+.room-info {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.rooms-list {
+  list-style: none;
+  flex: 1;
+  overflow-y: auto;
+  overflow-x: hidden;
+  min-height: 0;
+  max-height: 150px;
+}
+
+/* Joined rooms container */
+.joined-rooms {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.joined-rooms h4 {
+  margin-bottom: 0.5rem;
+  flex-shrink: 0;
+}
+
+.room-item {
+  padding: 0.5rem;
+  border-bottom: 1px solid;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.room-item:hover {
+}
+
+.room-item.active {
+  border-left: 3px solid;
+}
+
+.room-item .room-info {
+  flex: 1;
+}
+
+.room-details {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+
+.room-name {
+  font-weight: bold;
+  font-size: 0.9rem;
+}
+
+.room-id-container {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.room-id {
+  font-size: 0.75rem;
+  font-family: monospace;
+  word-break: break-all;
+  flex: 1;
+  min-width: 0;
+  max-width: 200px;
+  overflow-wrap: break-word;
+  line-height: 1.2;
+}
+
+.copy-btn {
+  padding: 0.2rem 0.4rem;
+  font-size: 0.7rem;
+  border: 1px solid;
+  cursor: pointer;
+  min-width: fit-content;
+}
+
+.copy-btn:hover {
+}
+
+.room-actions {
+  display: flex;
+  gap: 0.25rem;
+}
+
+.small-btn {
+  padding: 0.25rem 0.5rem;
+  font-size: 0.75rem;
+  border: 1px solid;
+  cursor: pointer;
+}
+
+.small-btn:hover {
+}
+
+.small-btn.danger {
+  border: 1px solid;
 }

@@ -37,9 +37,48 @@
             </div>
           </div>
           
+          <div class="rooms-section" style="display: none;" id="rooms-section">
+            <h3>Chat Rooms</h3>
+            <div class="room-controls">
+              <div class="form-group">
+                <input 
+                  id="room-name-input" 
+                  placeholder="Room name..."
+                  maxlength="30"
+                />
+                <button id="create-room-btn" type="button">Create Room</button>
+              </div>
+              <div class="form-group">
+                <input 
+                  id="room-id-input" 
+                  placeholder="Room ID to join..."
+                  maxlength="36"
+                />
+                <button id="join-room-btn" type="button">Join Room</button>
+              </div>
+            </div>
+            <div class="current-room" id="current-room" style="display: none;">
+              <h4>Current Room:</h4>
+              <div class="room-info">
+                <span id="current-room-name">None</span>
+                <div class="current-room-actions">
+                  <button id="copy-current-room-btn" type="button" class="small-btn" style="display: none;" title="Copy Current Room ID">Copy ID</button>
+                  <button id="leave-current-room-btn" type="button" class="small-btn">Leave</button>
+                </div>
+              </div>
+            </div>
+            <div class="joined-rooms">
+              <h4>Joined Rooms (<span id="rooms-count">0</span>)</h4>
+              <ul id="rooms-list" class="rooms-list"></ul>
+            </div>
+          </div>
+          
           <div class="peers-section">
             <h3>Connected Peers (<span id="peer-count">0</span>)</h3>
             <ul id="peers-list" class="peers-list"></ul>
+            <div class="peer-actions">
+              <button id="invite-peer-btn" type="button" class="small-btn">Invite Peer</button>
+            </div>
           </div>
         </aside>
 
@@ -48,7 +87,6 @@
             <div class="welcome-message">
               <p>Welcome to WireTalk P2P!</p>
               <p>Set your username and join the network to start chatting with peers.</p>
-              <p><strong>No servers needed!</strong> Your messages are sent directly peer-to-peer.</p>
             </div>
           </div>
           
