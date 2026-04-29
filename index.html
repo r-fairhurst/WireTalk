@@ -73,6 +73,53 @@
             </div>
           </div>
           
+          <div class="encryption-section" style="display: none;" id="encryption-section">
+            <h3>End-to-End Encryption</h3>
+            <div class="encryption-status">
+              <label class="toggle-switch">
+                <input type="checkbox" id="encryption-toggle" checked>
+                <span class="slider"></span>
+                E2EE Enabled
+              </label>
+              <div class="encryption-indicator" id="encryption-indicator">
+                <span class="lock-icon">[ENC]</span>
+                <span id="encryption-status-text">Messages are encrypted</span>
+              </div>
+            </div>
+            
+            <div class="our-identity">
+              <h4>Your Identity</h4>
+              <div class="key-info">
+                <label>Public Key Fingerprint:</label>
+                <code id="our-fingerprint" class="fingerprint">Loading...</code>
+                <button id="copy-fingerprint-btn" type="button" class="small-btn" title="Copy Fingerprint">Copy</button>
+              </div>
+              <small class="help-text">Share this fingerprint with peers to verify your identity</small>
+            </div>
+            
+            <div class="peer-keys">
+              <h4>Peer Keys & Verification</h4>
+              <div class="key-management">
+                <div class="form-group">
+                  <input id="peer-key-input" placeholder="Peer's public key (hex)..." maxlength="128" />
+                  <input id="peer-id-input" placeholder="Peer ID..." maxlength="52" />
+                  <button id="add-peer-key-btn" type="button" class="small-btn">Add Key</button>
+                </div>
+                <div class="auto-key-actions">
+                  <button id="auto-share-all-btn" type="button" class="small-btn">Auto-Share Keys with All Peers</button>
+                  <button id="request-all-keys-btn" type="button" class="small-btn">Request Keys from All Peers</button>
+                </div>
+              </div>
+              <ul id="peer-keys-list" class="peer-keys-list">
+                <li class="empty-state">No peer keys added yet</li>
+              </ul>
+            </div>
+            
+            <div class="mitm-warning" id="mitm-warning" style="display: none;">
+              <strong>Security Warning:</strong> Always verify key fingerprints through a secure channel to prevent man-in-the-middle attacks!
+            </div>
+          </div>
+
           <div class="peers-section">
             <h3>Connected Peers (<span id="peer-count">0</span>)</h3>
             <ul id="peers-list" class="peers-list"></ul>

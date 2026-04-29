@@ -7,6 +7,21 @@ interface Message {
   content: string;
   timestamp: string;
   room_id: string;
+  encrypted: boolean; // Whether this message is encrypted
+}
+
+interface PeerInfo {
+  id: string;
+  username: string;
+  public_key: number[]; // Array representation of [u8; 32]
+  key_fingerprint: string;
+  connected_at: string;
+  verified: boolean;
+}
+
+interface CryptoIdentity {
+  public_key: string; // Hex encoded
+  key_fingerprint: string;
 }
 
 interface User {
@@ -24,6 +39,8 @@ interface Room {
 interface NetworkStatus {
   connected: boolean;
   peer_id?: string;
+  public_key?: string;
+  key_fingerprint?: string;
   status: string;
 }
 
@@ -33,6 +50,9 @@ class P2PChatApp {
   private peerId: string = "";
   private currentRoom: string | null = null;
   private joinedRooms: Room[] = [];
+  private encryptionEnabled: boolean = true;
+  private ourFingerprint: string = "";
+  private peerKeys: PeerInfo[] = [];
   
   // DOM elements
   private usernameInput!: HTMLInputElement;
@@ -62,6 +82,21 @@ class P2PChatApp {
   private invitePeerBtn!: HTMLButtonElement;
   private roomsList!: HTMLElement;
   private roomsCount!: HTMLElement;
+  
+  // E2EE-related DOM elements
+  private encryptionSection!: HTMLElement;
+  private encryptionToggle!: HTMLInputElement;
+  private encryptionIndicator!: HTMLElement;
+  private encryptionStatusText!: HTMLElement;
+  private ourFingerprintEl!: HTMLElement;
+  private copyFingerprintBtn!: HTMLButtonElement;
+  private peerKeyInput!: HTMLInputElement;
+  private peerIdInputE2EE!: HTMLInputElement;
+  private addPeerKeyBtn!: HTMLButtonElement;
+  private autoShareAllBtn!: HTMLButtonElement;
+  private requestAllKeysBtn!: HTMLButtonElement;
+  private peerKeysList!: HTMLElement;
+  private mitmWarning!: HTMLElement;
 
   constructor() {
     this.initDOM();
@@ -98,6 +133,21 @@ class P2PChatApp {
     this.invitePeerBtn = document.getElementById("invite-peer-btn") as HTMLButtonElement;
     this.roomsList = document.getElementById("rooms-list")!;
     this.roomsCount = document.getElementById("rooms-count")!;
+    
+    // E2EE-related elements
+    this.encryptionSection = document.getElementById("encryption-section")!;
+    this.encryptionToggle = document.getElementById("encryption-toggle") as HTMLInputElement;
+    this.encryptionIndicator = document.getElementById("encryption-indicator")!;
+    this.encryptionStatusText = document.getElementById("encryption-status-text")!;
+    this.ourFingerprintEl = document.getElementById("our-fingerprint")!;
+    this.copyFingerprintBtn = document.getElementById("copy-fingerprint-btn") as HTMLButtonElement;
+    this.peerKeyInput = document.getElementById("peer-key-input") as HTMLInputElement;
+    this.peerIdInputE2EE = document.getElementById("peer-id-input") as HTMLInputElement;
+    this.addPeerKeyBtn = document.getElementById("add-peer-key-btn") as HTMLButtonElement;
+    this.autoShareAllBtn = document.getElementById("auto-share-all-btn") as HTMLButtonElement;
+    this.requestAllKeysBtn = document.getElementById("request-all-keys-btn") as HTMLButtonElement;
+    this.peerKeysList = document.getElementById("peer-keys-list")!;
+    this.mitmWarning = document.getElementById("mitm-warning")!;
   }
 
   private setupEventListeners(): void {
@@ -129,25 +179,49 @@ class P2PChatApp {
     this.roomIdInput.addEventListener("keypress", (e) => {
       if (e.key === "Enter") this.joinRoom();
     });
+    
+    // E2EE event listeners
+    this.encryptionToggle.addEventListener("change", () => this.toggleEncryption());
+    this.copyFingerprintBtn.addEventListener("click", () => this.copyOurFingerprint());
+    this.addPeerKeyBtn.addEventListener("click", () => this.addPeerKey());
+    this.autoShareAllBtn.addEventListener("click", () => this.autoShareKeysWithAllPeers());
+    this.requestAllKeysBtn.addEventListener("click", () => this.requestKeysFromAllPeers());
+    this.peerKeyInput.addEventListener("keypress", (e) => {
+      if (e.key === "Enter") this.addPeerKey();
+    });
   }
 
   private async setupTauriEventListeners(): Promise<void> {
     // Listen for P2P network events
-    await listen<string>("p2p_network_started", (event) => {
-      this.peerId = event.payload;
+    await listen<any>("p2p_network_started", (event) => {
+      const data = event.payload;
+      this.peerId = typeof data === 'string' ? data : data.peer_id;
+      this.ourFingerprint = data.key_fingerprint || '';
       this.connected = true;
-      this.updateConnectionStatus("connected", "Connected to P2P network");
+      this.updateConnectionStatus("connected", "Connected to P2P network (E2EE enabled)");
       this.peerIdDisplay.textContent = this.peerId;
       this.peerInfo.style.display = "block";
       this.roomsSection.style.display = "block";
+      this.encryptionSection.style.display = "block"; // Show E2EE section
       this.messageInput.disabled = false;
       this.sendBtn.disabled = false;
       this.joinNetworkBtn.disabled = true;
-      this.addSystemMessage("Connected to P2P network!");
+      this.addSystemMessage("Connected to P2P network with E2EE!");
       this.addSystemMessage(`Your peer ID: ${this.peerId.slice(0, 12)}...`);
+      this.addSystemMessage(`Key fingerprint: ${this.ourFingerprint}`);
       this.addSystemMessage("Create or join a room to start chatting!");
-      this.updatePeersList(); // Update peer list when network starts
-      this.updateRoomsList(); // Initialize rooms list
+      this.updateOurIdentityDisplay();
+      this.updatePeersList();
+      this.updateRoomsList();
+      this.loadPeerKeys();
+    });
+    
+    // Listen for E2EE events
+    await listen<boolean>("encryption_toggled", (event) => {
+      this.encryptionEnabled = event.payload;
+      this.updateEncryptionStatus();
+      const status = this.encryptionEnabled ? "enabled" : "disabled";
+      this.addSystemMessage(`End-to-end encryption ${status}`);
     });
 
     await listen<Message>("message_sent", (event) => {
@@ -167,6 +241,30 @@ class P2PChatApp {
       const peer = event.payload;
       this.addSystemMessage(`Peer joined: ${peer.username}`);
       this.updatePeersList();
+      // Automatically try to share keys with new peer
+      this.autoShareKeyWithPeer(peer.id);
+    });
+    
+    await listen<any>("key_exchange_sent", (event) => {
+      const data = event.payload;
+      this.addSystemMessage(`Key sent to peer ${data.peer_id.slice(0, 12)}...`);
+    });
+    
+    await listen<any>("key_exchange_received", (event) => {
+      const data = event.payload;
+      if (data.success) {
+        this.addSystemMessage(`Received and added key from peer ${data.peer_id.slice(0, 12)}...`);
+        this.addSystemMessage(`Fingerprint: ${data.key_fingerprint}`);
+        // Refresh peer list to show key status
+        this.updatePeersList();
+      } else {
+        this.addSystemMessage(`Failed to add key from peer ${data.peer_id.slice(0, 12)}...: ${data.error || 'Unknown error'}`);
+      }
+    });
+    
+    await listen<any>("peer_invited", (event) => {
+      const data = event.payload;
+      this.addSystemMessage(`Successfully invited peer ${data.peer_id.slice(0, 12)}... to room ${data.room_id}`);
     });
 
     await listen<User>("peer_left", (event) => {
@@ -380,12 +478,16 @@ class P2PChatApp {
         return;
       }
 
-      const peerOptions = peers.map(peer => `${peer.username} (${peer.id.slice(0, 12)}...)`);
-      const peerSelection = prompt(`Enter the number of the peer to invite:\n${peerOptions.map((opt, i) => `${i + 1}. ${opt}`).join('\n')}`);
+      // Create a more user-friendly selection interface
+      const peerOptions = peers.map((peer, index) => 
+        `${index + 1}. ${peer.username} (${peer.id.slice(0, 12)}...)`
+      ).join('\n');
       
-      if (!peerSelection) return;
+      const selection = prompt(`Select a peer to invite to the current room:\n\n${peerOptions}\n\nEnter the number:`);
+      
+      if (!selection) return;
 
-      const selectedIndex = parseInt(peerSelection) - 1;
+      const selectedIndex = parseInt(selection) - 1;
       if (isNaN(selectedIndex) || selectedIndex < 0 || selectedIndex >= peers.length) {
         alert("Invalid selection");
         return;
@@ -393,7 +495,7 @@ class P2PChatApp {
 
       const selectedPeer = peers[selectedIndex];
       await invoke("invite_to_room", { peerId: selectedPeer.id, roomId: this.currentRoom });
-      this.addSystemMessage(`Invited ${selectedPeer.username} to the room`);
+      this.addSystemMessage(`Invited ${selectedPeer.username} to room ${this.currentRoom}`);
     } catch (error) {
       console.error("Failed to invite peer:", error);
       alert(`Failed to invite peer: ${error}`);
@@ -405,13 +507,18 @@ class P2PChatApp {
     if (message.room_id !== this.currentRoom) return;
     
     const messageEl = document.createElement('div');
-    messageEl.className = `message ${isOwn ? 'own' : ''}`;
+    messageEl.className = `message ${isOwn ? 'own' : ''} ${message.encrypted ? 'encrypted' : 'plaintext'}`;
     
     const timestamp = new Date(message.timestamp).toLocaleTimeString();
+    
+    // Add encryption indicator
+    const encryptionIcon = message.encrypted ? '[ENC]' : '[PLAIN]';
+    const encryptionTitle = message.encrypted ? 'Encrypted message' : 'Plaintext message';
     
     messageEl.innerHTML = `
       <div class="message-header">
         <span class="message-username">${this.escapeHtml(message.username)}</span>
+        <span class="encryption-indicator" title="${encryptionTitle}">${encryptionIcon}</span>
         <span class="message-time">${timestamp}</span>
       </div>
       <div class="message-content">${this.escapeHtml(message.content)}</div>
@@ -590,7 +697,35 @@ class P2PChatApp {
 
     peers.forEach(peer => {
       const peerEl = document.createElement('li');
-      peerEl.textContent = peer.username;
+      peerEl.className = 'peer-item';
+      
+      const peerInfo = document.createElement('div');
+      peerInfo.className = 'peer-info-content';
+      peerInfo.innerHTML = `
+        <span class="peer-name">${this.escapeHtml(peer.username)}</span>
+        <span class="peer-id-short">${peer.id.slice(0, 8)}...</span>
+      `;
+      
+      const peerActions = document.createElement('div');
+      peerActions.className = 'peer-actions-inline';
+      
+      const shareKeyBtn = document.createElement('button');
+      shareKeyBtn.textContent = 'Share Key';
+      shareKeyBtn.className = 'small-btn';
+      shareKeyBtn.addEventListener('click', () => this.autoShareKeyWithPeer(peer.id));
+      
+      const inviteBtn = document.createElement('button');
+      inviteBtn.textContent = 'Invite';
+      inviteBtn.className = 'small-btn';
+      inviteBtn.addEventListener('click', () => this.invitePeerToRoom(peer.id));
+      
+      peerActions.appendChild(shareKeyBtn);
+      if (this.currentRoom) {
+        peerActions.appendChild(inviteBtn);
+      }
+      
+      peerEl.appendChild(peerInfo);
+      peerEl.appendChild(peerActions);
       this.peersList.appendChild(peerEl);
     });
   }
@@ -608,6 +743,244 @@ class P2PChatApp {
     const div = document.createElement('div');
     div.textContent = text;
     return div.innerHTML;
+  }
+  
+  // E2EE Functions
+  
+  private async toggleEncryption(): Promise<void> {
+    try {
+      const enabled = this.encryptionToggle.checked;
+      await invoke("toggle_encryption", { enabled });
+      this.encryptionEnabled = enabled;
+      this.updateEncryptionStatus();
+    } catch (error) {
+      console.error("Failed to toggle encryption:", error);
+      // Revert checkbox state on error
+      this.encryptionToggle.checked = this.encryptionEnabled;
+    }
+  }
+  
+  private updateEncryptionStatus(): void {
+    if (this.encryptionEnabled) {
+      this.encryptionStatusText.textContent = "Messages are encrypted";
+      this.encryptionIndicator.className = "encryption-indicator enabled";
+    } else {
+      this.encryptionStatusText.textContent = "Messages are NOT encrypted";
+      this.encryptionIndicator.className = "encryption-indicator disabled";
+    }
+  }
+  
+  private async updateOurIdentityDisplay(): Promise<void> {
+    try {
+      const identity = await invoke<CryptoIdentity>("get_our_identity");
+      this.ourFingerprint = identity.key_fingerprint;
+      this.ourFingerprintEl.textContent = identity.key_fingerprint;
+    } catch (error) {
+      console.error("Failed to get our identity:", error);
+      this.ourFingerprintEl.textContent = "Error loading";
+    }
+  }
+  
+  private async copyOurFingerprint(): Promise<void> {
+    if (this.ourFingerprint) {
+      await this.copyToClipboard(this.ourFingerprint);
+      this.addSystemMessage(`Your key fingerprint copied: ${this.ourFingerprint}`);
+    }
+  }
+  
+  private async addPeerKey(): Promise<void> {
+    const publicKeyHex = this.peerKeyInput.value.trim();
+    const peerId = this.peerIdInputE2EE.value.trim();
+    
+    if (!publicKeyHex || !peerId) {
+      alert("Please enter both peer ID and public key");
+      return;
+    }
+    
+    // Validate hex format (64 characters for 32 bytes)
+    if (!/^[0-9a-fA-F]{64}$/.test(publicKeyHex)) {
+      alert("Public key must be 64 hex characters (32 bytes)");
+      return;
+    }
+    
+    try {
+      const result = await invoke<string>("add_peer_key", {
+        peerId,
+        publicKeyHex
+      });
+      
+      this.addSystemMessage(`${result}`);
+      this.peerKeyInput.value = "";
+      this.peerIdInputE2EE.value = "";
+      this.loadPeerKeys();
+      this.showMitmWarning();
+    } catch (error) {
+      console.error("Failed to add peer key:", error);
+      alert(`Failed to add peer key: ${error}`);
+    }
+  }
+  
+  private async loadPeerKeys(): Promise<void> {
+    try {
+      const peers = await invoke<PeerInfo[]>("get_peer_identities");
+      this.peerKeys = peers;
+      this.displayPeerKeys(peers);
+    } catch (error) {
+      console.error("Failed to load peer keys:", error);
+    }
+  }
+  
+  private displayPeerKeys(peers: PeerInfo[]): void {
+    this.peerKeysList.innerHTML = '';
+    
+    if (peers.length === 0) {
+      const emptyEl = document.createElement('li');
+      emptyEl.className = 'empty-state';
+      emptyEl.textContent = 'No peer keys added yet';
+      this.peerKeysList.appendChild(emptyEl);
+      return;
+    }
+    
+    peers.forEach(peer => {
+      const peerEl = document.createElement('li');
+      peerEl.className = 'peer-key-item';
+      
+      const verificationStatus = peer.verified ? 'Verified' : 'Unverified';
+      const verificationClass = peer.verified ? 'verified' : 'unverified';
+      
+      peerEl.innerHTML = `
+        <div class="peer-key-info">
+          <div class="peer-id">${this.escapeHtml(peer.id.slice(0, 12))}...</div>
+          <div class="peer-fingerprint">${peer.key_fingerprint}</div>
+          <div class="verification-status ${verificationClass}">${verificationStatus}</div>
+        </div>
+        <div class="peer-key-actions">
+          <button class="verify-btn small-btn" title="Verify fingerprint">Verify</button>
+          <button class="copy-fingerprint-btn small-btn" title="Copy fingerprint">Copy</button>
+        </div>
+      `;
+      
+      // Add event listeners
+      const verifyBtn = peerEl.querySelector('.verify-btn') as HTMLButtonElement;
+      const copyBtn = peerEl.querySelector('.copy-fingerprint-btn') as HTMLButtonElement;
+      
+      verifyBtn.addEventListener('click', () => this.verifyPeerFingerprint(peer));
+      copyBtn.addEventListener('click', () => this.copyToClipboard(peer.key_fingerprint));
+      
+      this.peerKeysList.appendChild(peerEl);
+    });
+  }
+  
+  private async verifyPeerFingerprint(peer: PeerInfo): Promise<void> {
+    const userInput = prompt(
+      `Verify ${peer.id.slice(0, 12)}...'s key fingerprint:\\n\\n` +
+      `Expected: ${peer.key_fingerprint}\\n\\n` +
+      `Please verify this fingerprint through a secure channel (voice call, in person, etc.)\\n` +
+      `Type 'VERIFIED' if the fingerprint matches:`
+    );
+    
+    if (userInput === 'VERIFIED') {
+      try {
+        const isValid = await invoke<boolean>("verify_peer_fingerprint", {
+          peerId: peer.id,
+          expectedFingerprint: peer.key_fingerprint
+        });
+        
+        if (isValid) {
+          this.addSystemMessage(`Peer ${peer.id.slice(0, 12)}... verified successfully`);
+          peer.verified = true; // Update local state
+          this.displayPeerKeys(this.peerKeys); // Refresh display
+        } else {
+          this.addSystemMessage(`Fingerprint verification failed for ${peer.id.slice(0, 12)}...`);
+        }
+      } catch (error) {
+        console.error("Failed to verify peer fingerprint:", error);
+        this.addSystemMessage("Verification failed");
+      }
+    } else if (userInput !== null) {
+      this.addSystemMessage("Verification cancelled - peer remains unverified");
+    }
+  }
+  
+  private showMitmWarning(): void {
+    this.mitmWarning.style.display = "block";
+    // Auto-hide after 10 seconds
+    setTimeout(() => {
+      this.mitmWarning.style.display = "none";
+    }, 10000);
+  }
+  
+  private async autoShareKeysWithAllPeers(): Promise<void> {
+    try {
+      const peers = await invoke<User[]>("get_connected_peers");
+      if (peers.length === 0) {
+        this.addSystemMessage("No connected peers to share keys with");
+        return;
+      }
+      
+      let successCount = 0;
+      for (const peer of peers) {
+        try {
+          await this.autoShareKeyWithPeer(peer.id);
+          successCount++;
+        } catch (error) {
+          console.error(`Failed to share key with ${peer.id}:`, error);
+        }
+      }
+      
+      this.addSystemMessage(`Initiated key sharing with ${successCount}/${peers.length} peers`);
+    } catch (error) {
+      console.error("Failed to get connected peers:", error);
+      this.addSystemMessage("Failed to share keys with peers");
+    }
+  }
+  
+  private async autoShareKeyWithPeer(peerId: string): Promise<void> {
+    try {
+      const result = await invoke<string>("auto_share_keys_with_peer", { peerId });
+      console.log(`Key sharing result for ${peerId}:`, result);
+    } catch (error) {
+      console.error(`Failed to share key with ${peerId}:`, error);
+      throw error;
+    }
+  }
+  
+  private async requestKeysFromAllPeers(): Promise<void> {
+    try {
+      const peers = await invoke<User[]>("get_connected_peers");
+      if (peers.length === 0) {
+        this.addSystemMessage("No connected peers to request keys from");
+        return;
+      }
+      
+      this.addSystemMessage(`Requesting public keys from ${peers.length} peer(s)...`);
+      this.addSystemMessage("In a production app, this would send key requests via P2P network");
+      
+      // Show peer information for manual key exchange
+      for (const peer of peers) {
+        this.addSystemMessage(`Peer: ${peer.username} (ID: ${peer.id})`);
+      }
+      
+      this.addSystemMessage("Ask peers to share their keys using the 'Auto-Share' button or provide them manually");
+    } catch (error) {
+      console.error("Failed to request keys:", error);
+      this.addSystemMessage("Failed to request keys from peers");
+    }
+  }
+  
+  private async invitePeerToRoom(peerId: string): Promise<void> {
+    if (!this.currentRoom) {
+      this.addSystemMessage("Please join a room first");
+      return;
+    }
+    
+    try {
+      await invoke("invite_to_room", { peerId, roomId: this.currentRoom });
+      this.addSystemMessage(`Invited peer ${peerId.slice(0, 12)}... to room`);
+    } catch (error) {
+      console.error("Failed to invite peer:", error);
+      this.addSystemMessage("Failed to invite peer to room");
+    }
   }
 }
 

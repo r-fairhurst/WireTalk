@@ -32,6 +32,7 @@ pub struct P2PNetwork {
 pub enum P2PCommand {
     SendMessage { content: String, username: String },
     SendMessageToRoom { content: String, username: String, room_id: String },
+    SendKeyExchange { public_key: String, key_fingerprint: String, peer_id: String },
     JoinRoom { room_id: String },
     LeaveRoom { room_id: String },
     UpdateUsername { username: String },
@@ -42,6 +43,7 @@ pub enum P2PCommand {
 #[derive(Debug, Clone)]
 pub enum P2PEvent {
     MessageReceived(Message),
+    KeyExchangeReceived { peer_id: String, public_key: String, key_fingerprint: String },
     PeerJoined { peer_id: PeerId, username: Option<String> },
     PeerLeft { peer_id: PeerId, username: String },
     PeerListUpdated { peers: Vec<User> },
@@ -146,6 +148,7 @@ impl P2PNetwork {
                                 content,
                                 timestamp: chrono::Utc::now(),
                                 room_id: "default".to_string(),
+                                encrypted: false, // P2P layer doesn't know about encryption
                             };
                             
                             let message_json = serde_json::to_string(&message)
@@ -162,6 +165,7 @@ impl P2PNetwork {
                                 content,
                                 timestamp: chrono::Utc::now(),
                                 room_id: room_id.clone(),
+                                encrypted: false, // P2P layer doesn't know about encryption
                             };
                             
                             let message_json = serde_json::to_string(&message)
@@ -170,6 +174,25 @@ impl P2PNetwork {
                             let room_topic = gossipsub::IdentTopic::new(format!("wiretalk-room-{}", room_id));
                             if let Err(e) = swarm.behaviour_mut().gossipsub.publish(room_topic, message_json.as_bytes()) {
                                 tracing::error!("Failed to publish room message: {}", e);
+                            }
+                        }
+                        Some(P2PCommand::SendKeyExchange { public_key, key_fingerprint, peer_id }) => {
+                            let key_exchange = serde_json::json!({
+                                "type": "key_exchange",
+                                "peer_id": swarm.local_peer_id().to_string(),
+                                "public_key": public_key,
+                                "key_fingerprint": key_fingerprint,
+                                "timestamp": chrono::Utc::now().to_rfc3339()
+                            });
+                            
+                            let key_exchange_json = serde_json::to_string(&key_exchange)
+                                .expect("Failed to serialize key exchange");
+                            
+                            // Send on default topic so all peers can see it
+                            if let Err(e) = swarm.behaviour_mut().gossipsub.publish(default_topic.clone(), key_exchange_json.as_bytes()) {
+                                tracing::error!("Failed to publish key exchange: {}", e);
+                            } else {
+                                tracing::info!("Sent key exchange to peer: {}", peer_id);
                             }
                         }
                         Some(P2PCommand::JoinRoom { room_id }) => {
@@ -225,8 +248,28 @@ impl P2PNetwork {
                     message_id: _,
                     message,
                 }) => {
-                    // Handle incoming chat messages
+                    // Handle incoming messages
                     if let Ok(message_str) = String::from_utf8(message.data.clone()) {
+                        // Try to parse as key exchange first
+                        if let Ok(key_exchange) = serde_json::from_str::<serde_json::Value>(&message_str) {
+                            if key_exchange.get("type").and_then(|t| t.as_str()) == Some("key_exchange") {
+                                if let (Some(peer_id), Some(public_key), Some(key_fingerprint)) = (
+                                    key_exchange.get("peer_id").and_then(|p| p.as_str()),
+                                    key_exchange.get("public_key").and_then(|k| k.as_str()),
+                                    key_exchange.get("key_fingerprint").and_then(|f| f.as_str())
+                                ) {
+                                    tracing::info!("Received key exchange from peer: {}", peer_id);
+                                    let _ = event_sender.send(P2PEvent::KeyExchangeReceived {
+                                        peer_id: peer_id.to_string(),
+                                        public_key: public_key.to_string(),
+                                        key_fingerprint: key_fingerprint.to_string(),
+                                    });
+                                }
+                                return; // Don't process as regular message
+                            }
+                        }
+                        
+                        // Try to parse as regular chat message
                         if let Ok(chat_message) = serde_json::from_str::<Message>(&message_str) {
                             tracing::info!("Received message: {:?}", chat_message);
                             
@@ -338,6 +381,12 @@ impl P2PNetwork {
         self.message_sender
             .send(P2PCommand::SendMessageToRoom { content, username, room_id })
             .map_err(|e| anyhow::anyhow!("Failed to send room message command: {}", e))
+    }
+
+    pub async fn send_key_exchange(&self, public_key: String, key_fingerprint: String, peer_id: String) -> Result<()> {
+        self.message_sender
+            .send(P2PCommand::SendKeyExchange { public_key, key_fingerprint, peer_id })
+            .map_err(|e| anyhow::anyhow!("Failed to send key exchange command: {}", e))
     }
 
     pub async fn join_room(&self, room_id: String) -> Result<()> {
