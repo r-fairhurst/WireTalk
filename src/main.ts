@@ -53,7 +53,8 @@ class P2PChatApp {
   private encryptionEnabled: boolean = true;
   private ourFingerprint: string = "";
   private peerKeys: PeerInfo[] = [];
-  
+  private wgActive: boolean = false;
+
   // DOM elements
   private usernameInput!: HTMLInputElement;
   private setUsernameBtn!: HTMLButtonElement;
@@ -98,10 +99,30 @@ class P2PChatApp {
   private peerKeysList!: HTMLElement;
   private mitmWarning!: HTMLElement;
 
+  // WireGuard DOM elements
+  private wgSetupBtn!: HTMLButtonElement;
+  private wgIpInput!: HTMLInputElement;
+  private wgPortInput!: HTMLInputElement;
+  private wgSetupPanel!: HTMLElement;
+  private wgActivePanel!: HTMLElement;
+  private wgStatusIndicator!: HTMLElement;
+  private wgStatusText!: HTMLElement;
+  private wgPublicKey!: HTMLElement;
+  private wgTunnelIp!: HTMLElement;
+  private wgMyEndpointInput!: HTMLInputElement;
+  private wgCopyConfigBtn!: HTMLButtonElement;
+  private wgPeerConfigInput!: HTMLTextAreaElement;
+  private wgAddPeerBtn!: HTMLButtonElement;
+  private wgMultiaddrInput!: HTMLInputElement;
+  private wgDialBtn!: HTMLButtonElement;
+  private wgCopyAddrsBtn!: HTMLButtonElement;
+  private wgTeardownBtn!: HTMLButtonElement;
+
   constructor() {
     this.initDOM();
     this.setupEventListeners();
     this.setupTauriEventListeners();
+    this.cleanupStaleWireGuardOnStartup();
     this.checkNetworkStatus();
   }
 
@@ -148,6 +169,26 @@ class P2PChatApp {
     this.requestAllKeysBtn = document.getElementById("request-all-keys-btn") as HTMLButtonElement;
     this.peerKeysList = document.getElementById("peer-keys-list")!;
     this.mitmWarning = document.getElementById("mitm-warning")!;
+
+    // WireGuard elements
+    this.wgSetupBtn = document.getElementById("wg-setup-btn") as HTMLButtonElement;
+    this.wgIpInput = document.getElementById("wg-ip-input") as HTMLInputElement;
+    this.wgPortInput = document.getElementById("wg-port-input") as HTMLInputElement;
+    this.wgSetupPanel = document.getElementById("wg-setup-panel")!;
+    this.wgActivePanel = document.getElementById("wg-active-panel")!;
+    this.wgStatusIndicator = document.getElementById("wg-status-indicator")!;
+    this.wgStatusText = document.getElementById("wg-status-text")!;
+    this.wgPublicKey = document.getElementById("wg-public-key")!;
+    this.wgTunnelIp = document.getElementById("wg-tunnel-ip")!;
+    this.wgMyEndpointInput = document.getElementById("wg-my-endpoint-input") as HTMLInputElement;
+    this.wgCopyConfigBtn = document.getElementById("wg-copy-config-btn") as HTMLButtonElement;
+    this.wgPeerConfigInput = document.getElementById("wg-peer-config-input") as HTMLTextAreaElement;
+    this.wgAddPeerBtn = document.getElementById("wg-add-peer-btn") as HTMLButtonElement;
+    this.wgMultiaddrInput = document.getElementById("wg-multiaddr-input") as HTMLInputElement;
+    this.wgDialBtn = document.getElementById("wg-dial-btn") as HTMLButtonElement;
+    this.wgCopyAddrsBtn = document.getElementById("wg-copy-addrs-btn") as HTMLButtonElement;
+    this.wgTeardownBtn = document.getElementById("wg-teardown-btn") as HTMLButtonElement;
+
   }
 
   private setupEventListeners(): void {
@@ -189,6 +230,14 @@ class P2PChatApp {
     this.peerKeyInput.addEventListener("keypress", (e) => {
       if (e.key === "Enter") this.addPeerKey();
     });
+
+    // WireGuard event listeners
+    this.wgSetupBtn.addEventListener("click", () => this.setupWireGuard());
+    this.wgCopyConfigBtn.addEventListener("click", () => this.copyWireGuardConfig());
+    this.wgAddPeerBtn.addEventListener("click", () => this.addWireGuardPeerFromConfig());
+    this.wgDialBtn.addEventListener("click", () => this.dialPeerViaWireGuard());
+    this.wgCopyAddrsBtn.addEventListener("click", () => this.copyListenAddresses());
+    this.wgTeardownBtn.addEventListener("click", () => this.teardownWireGuard());
   }
 
   private async setupTauriEventListeners(): Promise<void> {
@@ -306,6 +355,16 @@ class P2PChatApp {
       this.updateCurrentRoomDisplay();
       this.clearAndLoadMessages();
       this.addSystemMessage(`Switched to room: ${event.payload}`);
+    });
+
+    // WireGuard events
+    await listen<{ active: boolean }>("wireguard_status_changed", (event) => {
+      this.wgActive = event.payload.active;
+      this.updateWireGuardStatusDisplay();
+      const statusMsg = event.payload.active
+        ? "WireGuard tunnel is now active"
+        : "WireGuard tunnel has been torn down";
+      this.addSystemMessage(statusMsg);
     });
   }
 
@@ -968,6 +1027,216 @@ class P2PChatApp {
     }
   }
   
+  // ─── WireGuard Methods ───────────────────────────────────────────────────
+
+  private async cleanupStaleWireGuardOnStartup(): Promise<void> {
+    try {
+      const cleaned = await invoke<boolean>("cleanup_stale_wireguard");
+      if (cleaned) {
+        this.addSystemMessage("Cleaned up stale WireGuard interface from previous run.");
+      }
+    } catch (error) {
+      console.error("Startup WireGuard cleanup failed:", error);
+    } finally {
+      await this.checkWireGuardStatus();
+    }
+  }
+
+  private async checkWireGuardStatus(): Promise<void> {
+    try {
+      const active = await invoke<boolean>("get_wireguard_status");
+      this.wgActive = active;
+      this.updateWireGuardStatusDisplay();
+      if (active) {
+        // Restore config display
+        const config = await invoke<any>("get_wireguard_config");
+        if (config) {
+          this.wgPublicKey.textContent = config.public_key;
+          this.wgTunnelIp.textContent = config.interface_ip;
+        }
+      }
+    } catch (error) {
+      console.error("Failed to check WireGuard status:", error);
+    }
+  }
+
+  private updateWireGuardStatusDisplay(): void {
+    if (this.wgActive) {
+      this.wgStatusIndicator.className = "status-indicator connected";
+      this.wgStatusText.textContent = "Active";
+      this.wgSetupPanel.style.display = "none";
+      this.wgActivePanel.style.display = "block";
+    } else {
+      this.wgStatusIndicator.className = "status-indicator";
+      this.wgStatusText.textContent = "Not configured";
+      this.wgSetupPanel.style.display = "block";
+      this.wgActivePanel.style.display = "none";
+    }
+  }
+
+  private async setupWireGuard(): Promise<void> {
+    const interfaceIp = this.wgIpInput.value.trim();
+    const listenPort = parseInt(this.wgPortInput.value.trim()) || 51820;
+
+    if (!interfaceIp) {
+      alert("Please enter a tunnel IP address (e.g. 10.10.10.1/24)");
+      return;
+    }
+
+    // Validate CIDR format
+    if (!/^\/?(\d{1,3}\.){3}\d{1,3}\/\d{1,2}$/.test(interfaceIp) &&
+        !/^(\d{1,3}\.){3}\d{1,3}\/\d{1,2}$/.test(interfaceIp)) {
+      alert("Please use CIDR notation, e.g. 10.10.10.1/24");
+      return;
+    }
+
+    this.wgSetupBtn.disabled = true;
+    this.wgSetupBtn.textContent = "Setting up...";
+
+    try {
+      const config = await invoke<any>("setup_wireguard", {
+        interfaceIp,
+        listenPort
+      });
+
+      this.wgPublicKey.textContent = config.public_key;
+      this.wgTunnelIp.textContent = config.interface_ip;
+      this.wgActive = true;
+      this.updateWireGuardStatusDisplay();
+
+      this.addSystemMessage("WireGuard tunnel setup complete!");
+      this.addSystemMessage(`Your public key: ${config.public_key}`);
+      this.addSystemMessage(`Tunnel IP: ${config.interface_ip}`);
+      this.addSystemMessage("Copy your shareable config and send it to peers, then have them paste it into 'Add Peer'.");
+    } catch (error) {
+      console.error("WireGuard setup failed:", error);
+      alert(`WireGuard setup failed: ${error}`);
+    } finally {
+      this.wgSetupBtn.disabled = false;
+      this.wgSetupBtn.textContent = "Setup WireGuard";
+    }
+  }
+
+  private async teardownWireGuard(): Promise<void> {
+    if (!confirm("Tear down the WireGuard tunnel? This will disconnect cross-network peers.")) return;
+
+    try {
+      await invoke("teardown_wireguard");
+      this.wgActive = false;
+      this.updateWireGuardStatusDisplay();
+      this.addSystemMessage("WireGuard tunnel torn down.");
+    } catch (error) {
+      console.error("WireGuard teardown failed:", error);
+      alert(`Teardown failed: ${error}`);
+    }
+  }
+
+  private async copyWireGuardConfig(): Promise<void> {
+    const endpoint = this.wgMyEndpointInput.value.trim() || undefined;
+    try {
+      const shareableCfg = await invoke<any>("get_wireguard_shareable_config", {
+        myEndpoint: endpoint ?? null
+      });
+      if (!shareableCfg) {
+        alert("No WireGuard config available.");
+        return;
+      }
+      const json = JSON.stringify(shareableCfg, null, 2);
+      await navigator.clipboard.writeText(json);
+      this.addSystemMessage("Shareable config copied to clipboard! Send it to your peer.");
+      this.addSystemMessage(`Config: ${JSON.stringify(shareableCfg)}`);
+    } catch (error) {
+      console.error("Failed to copy WireGuard config:", error);
+      alert(`Failed: ${error}`);
+    }
+  }
+
+  private async addWireGuardPeerFromConfig(): Promise<void> {
+    const raw = this.wgPeerConfigInput.value.trim();
+    if (!raw) {
+      alert("Paste the peer's shareable config JSON first.");
+      return;
+    }
+
+    // Validate it's valid JSON with expected keys before sending to backend
+    let parsed: any;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      alert("Invalid JSON. Please paste the exact config your peer copied.");
+      return;
+    }
+
+    if (!parsed.public_key || !parsed.tunnel_ip) {
+      alert("Config is missing required fields (public_key, tunnel_ip).");
+      return;
+    }
+
+    this.wgAddPeerBtn.disabled = true;
+    this.wgAddPeerBtn.textContent = "Adding...";
+
+    try {
+      const result = await invoke<string>("add_wireguard_peer_from_config", {
+        peerConfigJson: raw
+      });
+      this.wgPeerConfigInput.value = "";
+      this.addSystemMessage(`WireGuard peer added: ${result}`);
+      if (parsed.peer_id && parsed.libp2p_port) {
+        this.addSystemMessage(`Auto-dialing P2P layer at ${parsed.tunnel_ip}:${parsed.libp2p_port}...`);
+      } else {
+        this.addSystemMessage(`Peer is reachable at ${parsed.tunnel_ip} — ask them to share a config generated after joining the P2P network for auto-dial.`);
+      }
+    } catch (error) {
+      console.error("Failed to add WireGuard peer:", error);
+      alert(`Failed to add peer: ${error}`);
+    } finally {
+      this.wgAddPeerBtn.disabled = false;
+      this.wgAddPeerBtn.textContent = "Add Peer Automatically";
+    }
+  }
+
+  private async dialPeerViaWireGuard(): Promise<void> {
+    const multiaddr = this.wgMultiaddrInput.value.trim();
+    if (!multiaddr) {
+      alert("Enter a multiaddr, e.g. /ip4/10.10.10.2/tcp/PORT/p2p/PEER_ID");
+      return;
+    }
+
+    if (!this.connected) {
+      alert("Join the P2P network first.");
+      return;
+    }
+
+    try {
+      const result = await invoke<string>("dial_peer", { multiaddr });
+      this.addSystemMessage(`Dialing peer: ${result}`);
+    } catch (error) {
+      console.error("Dial failed:", error);
+      alert(`Dial failed: ${error}`);
+    }
+  }
+
+  private async copyListenAddresses(): Promise<void> {
+    if (!this.connected) {
+      alert("Join the P2P network first to see listen addresses.");
+      return;
+    }
+    try {
+      const addrs = await invoke<string[]>("get_listen_addresses");
+      if (addrs.length === 0) {
+        this.addSystemMessage("No listen addresses available yet. Wait a moment and try again.");
+        return;
+      }
+      const text = addrs.join("\n");
+      await navigator.clipboard.writeText(text);
+      this.addSystemMessage("Your listen addresses copied to clipboard:");
+      addrs.forEach(a => this.addSystemMessage(`  ${a}`));
+    } catch (error) {
+      console.error("Failed to get listen addresses:", error);
+      alert(`Failed: ${error}`);
+    }
+  }
+
   private async invitePeerToRoom(peerId: string): Promise<void> {
     if (!this.currentRoom) {
       this.addSystemMessage("Please join a room first");

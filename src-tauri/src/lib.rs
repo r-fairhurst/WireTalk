@@ -10,8 +10,10 @@ use anyhow::Result;
 
 mod p2p_network;
 mod encryption;
+mod wireguard;
 use p2p_network::P2PNetwork;
 use encryption::{MessageCrypto, CryptoIdentity, KeyExchangeMessage};
+use wireguard::{WireGuardManager, WireGuardConfig, ShareablePeerConfig};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {
@@ -57,6 +59,7 @@ pub struct AppState {
     pub message_crypto: Arc<Mutex<Option<MessageCrypto>>>,
     pub pending_key_exchanges: Arc<Mutex<Vec<KeyExchangeMessage>>>,
     pub encryption_enabled: Arc<Mutex<bool>>,
+    pub wireguard: Arc<Mutex<WireGuardManager>>,
 }
 
 impl AppState {
@@ -70,6 +73,7 @@ impl AppState {
             message_crypto: Arc::new(Mutex::new(None)),
             pending_key_exchanges: Arc::new(Mutex::new(Vec::new())),
             encryption_enabled: Arc::new(Mutex::new(true)), // E2EE enabled by default
+            wireguard: Arc::new(Mutex::new(WireGuardManager::new())),
         }
     }
 }
@@ -116,6 +120,26 @@ async fn start_p2p_network(
                     // Check if this is an encrypted message
                     if let Ok(encrypted_data) = serde_json::from_str::<serde_json::Value>(&message.content) {
                         if encrypted_data.get("type").and_then(|t| t.as_str()) == Some("encrypted_message") {
+                            // Ignore encrypted envelopes that target other peers.
+                            let local_peer_id = {
+                                let network_lock = state_arc.p2p_network.lock().await;
+                                network_lock.as_ref().map(|n| n.get_peer_id().to_string())
+                            };
+
+                            if let (Some(targets), Some(local_id)) = (
+                                encrypted_data.get("encrypted_for").and_then(|v| v.as_array()),
+                                local_peer_id.as_ref(),
+                            ) {
+                                let intended_for_us = targets
+                                    .iter()
+                                    .filter_map(|v| v.as_str())
+                                    .any(|id| id == local_id);
+
+                                if !intended_for_us {
+                                    continue;
+                                }
+                            }
+
                             // This is an encrypted message, try to decrypt it
                             let crypto_lock = state_arc.message_crypto.lock().await;
                             if let Some(crypto) = &*crypto_lock {
@@ -189,7 +213,7 @@ async fn start_p2p_network(
                                 };
                                 let _ = app_clone.emit("message_received", &encrypted_message);
                             }
-                            return; // Don't process as regular message
+                            continue; // Don't process as regular message
                         }
                     }
                     
@@ -558,43 +582,35 @@ async fn send_p2p_message(
                     .collect();
                 
                 if !peers_with_keys.is_empty() {
-                    // Encrypt message for each peer we have keys for
-                    let mut encrypted_for_peers = Vec::new();
-                    
+                    // Encrypt and publish one message per recipient peer.
+                    let our_peer_id = network.get_peer_id().to_string();
+                    let mut sent_count = 0usize;
+
                     for peer in &peers_with_keys {
-                        if let Ok(_encrypted_content) = crypto.encrypt_message(&content, &peer.id, &room_id) {
-                            encrypted_for_peers.push(peer.id.clone());
-                        }
-                    }
-                    
-                    if !encrypted_for_peers.is_empty() {
-                        // Send encrypted message (for simplicity, we'll encrypt once and send to all)
-                        // In a real implementation, you'd encrypt separately for each peer
-                        if let Ok(encrypted_msg) = crypto.encrypt_message(&content, &peers_with_keys[0].id, &room_id) {
+                        if let Ok(encrypted_msg) = crypto.encrypt_message(&content, &peer.id, &room_id) {
                             let encrypted_message_json = serde_json::to_string(&encrypted_msg)
                                 .map_err(|e| format!("Failed to serialize encrypted message: {}", e))?;
-                            
-                            // Get our peer_id for the encrypted wrapper
-                            let our_peer_id = network.get_peer_id().to_string();
-                            
+
                             let encrypted_wrapper = serde_json::json!({
-                                "type": "encrypted_message", 
+                                "type": "encrypted_message",
                                 "content": encrypted_message_json,
                                 "sender": username,
                                 "sender_peer_id": our_peer_id,
-                                "encrypted_for": encrypted_for_peers
+                                "encrypted_for": [peer.id.clone()]
                             });
-                            
+
                             network.send_message_to_room(
-                                encrypted_wrapper.to_string(), 
-                                username.clone(), 
+                                encrypted_wrapper.to_string(),
+                                username.clone(),
                                 room_id.clone()
                             ).await
                                 .map_err(|e| format!("Failed to send encrypted P2P message: {}", e))?;
-                        } else {
-                            return Err("Failed to encrypt message".to_string());
+
+                            sent_count += 1;
                         }
-                    } else {
+                    }
+
+                    if sent_count == 0 {
                         return Err("Failed to encrypt message for any peer".to_string());
                     }
                 } else {
@@ -868,6 +884,245 @@ async fn get_network_status(state: State<'_, AppState>) -> Result<serde_json::Va
     Ok(status)
 }
 
+// ─── WireGuard Commands ────────────────────────────────────────────────────────
+
+/// Check whether WireGuard tools are installed on this machine.
+#[tauri::command]
+async fn check_wireguard_deps() -> Result<bool, String> {
+    Ok(WireGuardManager::check_dependencies().is_ok())
+}
+
+/// Auto-generate keys, write a config, and bring up the WireGuard interface.
+/// `interface_ip` must be CIDR, e.g. "10.10.10.1/24".
+#[tauri::command]
+async fn setup_wireguard(
+    interface_ip: String,
+    listen_port: Option<u16>,
+    state: State<'_, AppState>,
+    app: AppHandle,
+) -> Result<WireGuardConfig, String> {
+    let port = listen_port.unwrap_or(wireguard::DEFAULT_LISTEN_PORT);
+
+    let mut wg = state.wireguard.lock().await;
+
+    // If already active, report that
+    if wg.is_active() {
+        return Err("WireGuard interface is already up. Tear it down first.".to_string());
+    }
+
+    wg.setup(interface_ip, port)
+        .map_err(|e| format!("WireGuard setup failed: {}", e))?;
+
+    let config = wg
+        .get_config()
+        .ok_or_else(|| "Failed to retrieve WireGuard config after setup".to_string())?;
+
+    app.emit("wireguard_status_changed", serde_json::json!({ "active": true }))
+        .map_err(|e| format!("Failed to emit WG status: {}", e))?;
+
+    Ok(config)
+}
+
+/// Bring down the WireGuard interface.
+#[tauri::command]
+async fn teardown_wireguard(
+    state: State<'_, AppState>,
+    app: AppHandle,
+) -> Result<(), String> {
+    let mut wg = state.wireguard.lock().await;
+    wg.teardown()
+        .map_err(|e| format!("WireGuard teardown failed: {}", e))?;
+
+    app.emit("wireguard_status_changed", serde_json::json!({ "active": false }))
+        .map_err(|e| format!("Failed to emit WG status: {}", e))?;
+
+    Ok(())
+}
+
+/// Add a peer to the running WireGuard interface.
+/// `allowed_ip` is the peer's tunnel IP in CIDR, e.g. "10.10.10.2/32".
+/// `endpoint` is optional: "203.0.113.5:51820".
+#[tauri::command]
+async fn add_wireguard_peer(
+    public_key: String,
+    allowed_ip: String,
+    endpoint: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    let mut wg = state.wireguard.lock().await;
+    wg.add_peer(public_key.clone(), allowed_ip.clone(), endpoint)
+        .map_err(|e| format!("Failed to add WireGuard peer: {}", e))?;
+
+    Ok(format!(
+        "Peer {} added with allowed IP {}",
+        &public_key[..8],
+        allowed_ip
+    ))
+}
+
+/// Remove a peer from the running WireGuard interface by its public key.
+#[tauri::command]
+async fn remove_wireguard_peer(
+    public_key: String,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    let mut wg = state.wireguard.lock().await;
+    wg.remove_peer(&public_key)
+        .map_err(|e| format!("Failed to remove WireGuard peer: {}", e))?;
+    Ok(format!("Peer {} removed", &public_key[..8]))
+}
+
+/// Return the current WireGuard config (no private key).
+#[tauri::command]
+async fn get_wireguard_config(state: State<'_, AppState>) -> Result<Option<WireGuardConfig>, String> {
+    let wg = state.wireguard.lock().await;
+    Ok(wg.get_config())
+}
+
+/// Return a compact JSON blob the user can share with peers so they can be added automatically.
+/// `my_endpoint` is the caller's optional external IP:port (e.g. "203.0.113.5:51820").
+/// Automatically embeds the libp2p peer ID and TCP port so the recipient can auto-dial.
+#[tauri::command]
+async fn get_wireguard_shareable_config(
+    my_endpoint: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<Option<ShareablePeerConfig>, String> {
+    // Gather libp2p peer_id and listen port from the P2P network (if started)
+    let (libp2p_peer_id, libp2p_port) = {
+        let p2p_lock = state.p2p_network.lock().await;
+        if let Some(network) = &*p2p_lock {
+            let pid = network.peer_id.to_string();
+            // Parse TCP port from the first listen address of the form /ip4/.../tcp/PORT
+            let port = network
+                .get_listen_addresses()
+                .await
+                .ok()
+                .and_then(|addrs| {
+                    addrs.into_iter().find_map(|addr| {
+                        let parts: Vec<&str> = addr.split('/').collect();
+                        parts
+                            .windows(2)
+                            .find(|w| w[0] == "tcp")
+                            .and_then(|w| w[1].parse::<u16>().ok())
+                    })
+                });
+            (Some(pid), port)
+        } else {
+            (None, None)
+        }
+    };
+
+    let wg = state.wireguard.lock().await;
+    Ok(wg.get_shareable_config(my_endpoint, libp2p_peer_id, libp2p_port))
+}
+
+/// Return whether the WireGuard interface is currently active.
+#[tauri::command]
+async fn get_wireguard_status(state: State<'_, AppState>) -> Result<bool, String> {
+    let wg = state.wireguard.lock().await;
+    Ok(wg.is_active())
+}
+
+/// Best-effort startup cleanup for stale WireGuard interfaces left by previous runs.
+/// Returns true if cleanup was performed, false if there was nothing to clean.
+#[tauri::command]
+async fn cleanup_stale_wireguard(state: State<'_, AppState>) -> Result<bool, String> {
+    let mut wg = state.wireguard.lock().await;
+    if wg.is_active() {
+        wg.teardown()
+            .map_err(|e| format!("Failed to cleanup stale WireGuard interface: {}", e))?;
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
+/// Parse a peer's shareable config JSON and automatically add them.
+/// This is the one-click "add peer" from the UI.
+#[tauri::command]
+async fn add_wireguard_peer_from_config(
+    peer_config_json: String,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    let peer_cfg: ShareablePeerConfig = serde_json::from_str(&peer_config_json)
+        .map_err(|e| format!("Invalid peer config JSON: {}", e))?;
+
+    let allowed_ip = format!("{}/32", peer_cfg.tunnel_ip);
+    let endpoint = peer_cfg
+        .endpoint
+        .map(|ep| {
+            // If the endpoint doesn't include a port, append the peer's listen port
+            if ep.contains(':') {
+                ep
+            } else {
+                format!("{}:{}", ep, peer_cfg.listen_port)
+            }
+        });
+
+    let mut wg = state.wireguard.lock().await;
+    wg.add_peer(peer_cfg.public_key.clone(), allowed_ip.clone(), endpoint)
+        .map_err(|e| format!("Failed to add peer from config: {}", e))?;
+    drop(wg); // release lock before touching p2p_network
+
+    // Auto-dial the libp2p layer if the config includes peer_id and libp2p_port
+    let dial_result = if let (Some(pid), Some(port)) = (&peer_cfg.peer_id, peer_cfg.libp2p_port) {
+        let multiaddr = format!("/ip4/{}/tcp/{}/p2p/{}", peer_cfg.tunnel_ip, port, pid);
+        let p2p_lock = state.p2p_network.lock().await;
+        if let Some(network) = &*p2p_lock {
+            match network.dial_peer(multiaddr.clone()).await {
+                Ok(_) => format!(" — P2P auto-dial initiated to {}", multiaddr),
+                Err(e) => format!(" — P2P dial failed: {}", e),
+            }
+        } else {
+            " — P2P network not started; join a room to enable auto-dial".to_string()
+        }
+    } else {
+        String::new()
+    };
+
+    Ok(format!(
+        "Peer {} (tunnel IP {}) added successfully{}",
+        &peer_cfg.public_key[..8],
+        peer_cfg.tunnel_ip,
+        dial_result
+    ))
+}
+
+// ─── P2P Direct Dial Commands ─────────────────────────────────────────────────
+
+/// Return the libp2p listen addresses (useful for sharing the WireGuard tunnel address).
+#[tauri::command]
+async fn get_listen_addresses(state: State<'_, AppState>) -> Result<Vec<String>, String> {
+    let p2p_lock = state.p2p_network.lock().await;
+    if let Some(network) = &*p2p_lock {
+        network
+            .get_listen_addresses()
+            .await
+            .map_err(|e| format!("Failed to get listen addresses: {}", e))
+    } else {
+        Ok(Vec::new())
+    }
+}
+
+/// Dial a peer directly using a libp2p multiaddr.
+/// Example: "/ip4/10.10.10.2/tcp/45678/p2p/12D3KooW..."
+#[tauri::command]
+async fn dial_peer(
+    multiaddr: String,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    let p2p_lock = state.p2p_network.lock().await;
+    if let Some(network) = &*p2p_lock {
+        network
+            .dial_peer(multiaddr.clone())
+            .await
+            .map_err(|e| format!("Failed to dial peer: {}", e))?;
+        Ok(format!("Dialing {}", multiaddr))
+    } else {
+        Err("P2P network not initialized".to_string())
+    }
+}
+
 #[tauri::command]
 fn greet(name: &str) -> String {
     format!("Hello, {}! Welcome to WireTalk P2P!", name)
@@ -903,7 +1158,21 @@ pub fn run() {
             toggle_encryption,
             is_encryption_enabled,
             auto_share_keys_with_peer,
-            get_peer_public_key
+            get_peer_public_key,
+            // WireGuard commands
+            check_wireguard_deps,
+            setup_wireguard,
+            teardown_wireguard,
+            add_wireguard_peer,
+            remove_wireguard_peer,
+            get_wireguard_config,
+            get_wireguard_shareable_config,
+            get_wireguard_status,
+            cleanup_stale_wireguard,
+            add_wireguard_peer_from_config,
+            // Direct dial commands
+            get_listen_addresses,
+            dial_peer
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

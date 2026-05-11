@@ -37,6 +37,8 @@ pub enum P2PCommand {
     LeaveRoom { room_id: String },
     UpdateUsername { username: String },
     GetPeers { respond_to: mpsc::UnboundedSender<Vec<User>> },
+    GetListenAddresses { respond_to: mpsc::UnboundedSender<Vec<String>> },
+    DialPeer { addr: String },
     Shutdown,
 }
 
@@ -133,11 +135,12 @@ impl P2PNetwork {
         let default_topic = gossipsub::IdentTopic::new("wiretalk-chat");
         let mut connected_peers: HashMap<PeerId, User> = HashMap::new();
         let mut subscribed_rooms: HashSet<String> = HashSet::new();
+        let mut listen_addresses: Vec<String> = Vec::new();
         
         loop {
             tokio::select! {
                 event = swarm.select_next_some() => {
-                    Self::handle_swarm_event(&mut swarm, event, &event_sender, &mut connected_peers).await;
+                    Self::handle_swarm_event(&mut swarm, event, &event_sender, &mut connected_peers, &mut listen_addresses).await;
                 }
                 command = command_receiver.recv() => {
                     match command {
@@ -225,6 +228,23 @@ impl P2PNetwork {
                             let peers: Vec<User> = connected_peers.values().cloned().collect();
                             let _ = respond_to.send(peers);
                         }
+                        Some(P2PCommand::GetListenAddresses { respond_to }) => {
+                            let _ = respond_to.send(listen_addresses.clone());
+                        }
+                        Some(P2PCommand::DialPeer { addr }) => {
+                            match addr.parse::<libp2p::Multiaddr>() {
+                                Ok(multiaddr) => {
+                                    if let Err(e) = swarm.dial(multiaddr) {
+                                        tracing::error!("Failed to dial peer {}: {}", addr, e);
+                                    } else {
+                                        tracing::info!("Dialing peer at {}", addr);
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::error!("Invalid multiaddr {}: {}", addr, e);
+                                }
+                            }
+                        }
                         Some(P2PCommand::Shutdown) => {
                             break;
                         }
@@ -240,6 +260,7 @@ impl P2PNetwork {
         event: SwarmEvent<P2PNetworkBehaviourEvent>,
         event_sender: &mpsc::UnboundedSender<P2PEvent>,
         connected_peers: &mut HashMap<PeerId, User>,
+        listen_addresses: &mut Vec<String>,
     ) {
         match event {
             SwarmEvent::Behaviour(event) => match event {
@@ -324,7 +345,9 @@ impl P2PNetwork {
                 _ => {}
             }
             SwarmEvent::NewListenAddr { address, .. } => {
-                tracing::info!("Listening on {}", address);
+                let addr_str = address.to_string();
+                tracing::info!("Listening on {}", addr_str);
+                listen_addresses.push(addr_str);
             }
             SwarmEvent::ConnectionEstablished { peer_id, .. } => {
                 // Only send peer joined event if this is the first connection to this peer
@@ -423,6 +446,23 @@ impl P2PNetwork {
             
         receiver.recv().await
             .ok_or_else(|| anyhow::anyhow!("Failed to receive peers response"))
+    }
+
+    pub async fn get_listen_addresses(&self) -> Result<Vec<String>> {
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+
+        self.message_sender
+            .send(P2PCommand::GetListenAddresses { respond_to: sender })
+            .map_err(|e| anyhow::anyhow!("Failed to send get listen addresses command: {}", e))?;
+
+        receiver.recv().await
+            .ok_or_else(|| anyhow::anyhow!("Failed to receive listen addresses response"))
+    }
+
+    pub async fn dial_peer(&self, addr: String) -> Result<()> {
+        self.message_sender
+            .send(P2PCommand::DialPeer { addr })
+            .map_err(|e| anyhow::anyhow!("Failed to send dial peer command: {}", e))
     }
 
     pub fn get_peer_id(&self) -> PeerId {

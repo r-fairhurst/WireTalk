@@ -120,6 +120,74 @@
             </div>
           </div>
 
+          <!-- WireGuard Section -->
+          <div class="wireguard-section" id="wireguard-section">
+            <h3>WireGuard Tunnel</h3>
+            <div class="wg-status-row">
+              <div class="status-indicator" id="wg-status-indicator"></div>
+              <span id="wg-status-text">Not configured</span>
+            </div>
+
+            <!-- Setup -->
+            <div id="wg-setup-panel">
+              <div class="form-group">
+                <input
+                  id="wg-ip-input"
+                  placeholder="Tunnel IP (e.g. 10.10.10.1/24)"
+                  value="10.10.10.1/24"
+                />
+                <input
+                  id="wg-port-input"
+                  type="number"
+                  placeholder="Listen port"
+                  value="51820"
+                  min="1024"
+                  max="65535"
+                />
+                <button id="wg-setup-btn" type="button">Setup WireGuard</button>
+              </div>
+            </div>
+
+            <!-- Active panel (shown after setup) -->
+            <div id="wg-active-panel" style="display:none;">
+              <div class="wg-identity">
+                <label>Your Public Key:</label>
+                <code id="wg-public-key" class="fingerprint"></code>
+                <label>Tunnel IP:</label>
+                <code id="wg-tunnel-ip"></code>
+              </div>
+
+              <div class="form-group">
+                <input
+                  id="wg-my-endpoint-input"
+                  placeholder="Your external IP:port (optional)"
+                />
+                <button id="wg-copy-config-btn" type="button" class="small-btn">Copy Shareable Config</button>
+              </div>
+
+              <hr />
+
+              <h4>Add Peer</h4>
+              <div class="form-group">
+                <textarea
+                  id="wg-peer-config-input"
+                  placeholder='Paste peer config JSON here...'
+                  rows="3"
+                ></textarea>
+                <button id="wg-add-peer-btn" type="button" class="small-btn">Add Peer Automatically</button>
+              </div>
+
+              <h4>Direct P2P Connect</h4>
+              <div class="form-group">
+                <input id="wg-multiaddr-input" placeholder="/ip4/10.10.10.2/tcp/PORT/p2p/..." />
+                <button id="wg-dial-btn" type="button" class="small-btn">Dial Peer</button>
+                <button id="wg-copy-addrs-btn" type="button" class="small-btn">Copy My Addresses</button>
+              </div>
+
+              <button id="wg-teardown-btn" type="button" class="small-btn danger-btn">Teardown Tunnel</button>
+            </div>
+          </div>
+
           <div class="peers-section">
             <h3>Connected Peers (<span id="peer-count">0</span>)</h3>
             <ul id="peers-list" class="peers-list"></ul>

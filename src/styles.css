@@ -749,3 +749,72 @@ button:active {
 .small-btn.danger {
   border: 1px solid;
 }
+
+/* WireGuard section */
+.wireguard-section {
+  padding: 1rem;
+  border-bottom: 1px solid;
+  flex-shrink: 0;
+}
+
+.wireguard-section h3 {
+  margin-bottom: 0.5rem;
+  font-size: 1rem;
+}
+
+.wireguard-section h4 {
+  margin: 0.5rem 0 0.25rem;
+  font-size: 0.85rem;
+}
+
+.wg-status-row {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  margin-bottom: 0.5rem;
+  font-size: 0.85rem;
+}
+
+.wg-identity {
+  margin-bottom: 0.5rem;
+  font-size: 0.8rem;
+}
+
+.wg-identity label {
+  display: block;
+  margin-top: 0.25rem;
+  font-weight: bold;
+}
+
+.wg-identity code {
+  display: block;
+  word-break: break-all;
+  font-size: 0.75rem;
+  padding: 0.15rem 0.25rem;
+  border: 1px solid;
+  margin-bottom: 0.15rem;
+}
+
+#wg-peer-config-input {
+  width: 100%;
+  font-size: 0.75rem;
+  font-family: monospace;
+  resize: vertical;
+  border: 1px solid #ccc;
+  padding: 0.35rem;
+  background: white;
+}
+
+.danger-btn {
+  margin-top: 0.5rem;
+  width: 100%;
+}
+
+#wg-ip-input,
+#wg-port-input,
+#wg-my-endpoint-input,
+#wg-multiaddr-input {
+  width: 100%;
+  margin-bottom: 0.25rem;
+}
+
