@@ -21,16 +21,16 @@
       <div class="chat-container">
         <aside class="sidebar">
           <div class="user-setup">
-            <h3>P2P Network Setup</h3>
+            <h3>Quick Start</h3>
+            <p class="section-help">Enter your name and you will join automatically.</p>
             <div class="form-group">
               <input 
                 id="username-input" 
                 placeholder="Enter your username..."
                 maxlength="20"
               />
-              <button id="set-username-btn" type="button">Set Username</button>
+              <button id="set-username-btn" type="button">Use Name</button>
             </div>
-            <button id="join-network-btn" type="button" disabled>Join P2P Network</button>
             <div id="peer-info" class="peer-info" style="display: none;">
               <h4>Your Peer ID:</h4>
               <code id="peer-id-display"></code>
@@ -51,18 +51,19 @@
               <div class="form-group">
                 <input 
                   id="room-id-input" 
-                  placeholder="Room ID to join..."
-                  maxlength="36"
+                  placeholder="Room ID or invite code..."
+                  maxlength="120"
                 />
                 <button id="join-room-btn" type="button">Join Room</button>
               </div>
+              <p class="section-help">Tip: Paste a full invite code like wiretalk:room:...</p>
             </div>
             <div class="current-room" id="current-room" style="display: none;">
               <h4>Current Room:</h4>
               <div class="room-info">
                 <span id="current-room-name">None</span>
                 <div class="current-room-actions">
-                  <button id="copy-current-room-btn" type="button" class="small-btn" style="display: none;" title="Copy Current Room ID">Copy ID</button>
+                  <button id="copy-current-room-btn" type="button" class="small-btn" style="display: none;" title="Copy Room Invite Code">Copy Invite</button>
                   <button id="leave-current-room-btn" type="button" class="small-btn">Leave</button>
                 </div>
               </div>
@@ -97,27 +98,7 @@
               <small class="help-text">Share this fingerprint with peers to verify your identity</small>
             </div>
             
-            <div class="peer-keys">
-              <h4>Peer Keys & Verification</h4>
-              <div class="key-management">
-                <div class="form-group">
-                  <input id="peer-key-input" placeholder="Peer's public key (hex)..." maxlength="128" />
-                  <input id="peer-id-input" placeholder="Peer ID..." maxlength="52" />
-                  <button id="add-peer-key-btn" type="button" class="small-btn">Add Key</button>
-                </div>
-                <div class="auto-key-actions">
-                  <button id="auto-share-all-btn" type="button" class="small-btn">Auto-Share Keys with All Peers</button>
-                  <button id="request-all-keys-btn" type="button" class="small-btn">Request Keys from All Peers</button>
-                </div>
-              </div>
-              <ul id="peer-keys-list" class="peer-keys-list">
-                <li class="empty-state">No peer keys added yet</li>
-              </ul>
-            </div>
-            
-            <div class="mitm-warning" id="mitm-warning" style="display: none;">
-              <strong>Security Warning:</strong> Always verify key fingerprints through a secure channel to prevent man-in-the-middle attacks!
-            </div>
+            <small class="help-text">Keys are shared automatically when peers connect.</small>
           </div>
 
           <!-- WireGuard Section -->

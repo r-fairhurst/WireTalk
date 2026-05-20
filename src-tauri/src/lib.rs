@@ -26,16 +26,6 @@ pub struct Message {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PeerInfo {
-    pub id: String,
-    pub username: String,
-    pub public_key: [u8; 32],
-    pub key_fingerprint: String,
-    pub connected_at: DateTime<Utc>,
-    pub verified: bool, // Whether we've verified their key fingerprint
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Room {
     pub id: String,
     pub name: String,
@@ -233,7 +223,7 @@ async fn start_p2p_network(
                                 let mut key_array = [0u8; 32];
                                 key_array.copy_from_slice(&public_key_bytes);
                                 
-                                let peer_identity = crate::encryption::CryptoIdentity::from_public_key(key_array);
+                                let peer_identity = CryptoIdentity::from_public_key(key_array);
                                 
                                 if crypto.add_peer_key(&peer_id, peer_identity).is_ok() {
                                     tracing::info!("Automatically added key from peer: {}", peer_id);
@@ -287,9 +277,77 @@ async fn start_p2p_network(
                         }
                     }
                 }
+                p2p_network::P2PEvent::RoomInvitationReceived { room_id, inviter_peer_id, inviter_username } => {
+                    // Auto-join invited room to reduce manual setup for recipients.
+                    {
+                        let mut rooms_lock = state_arc.joined_rooms.lock().await;
+                        if !rooms_lock.iter().any(|r| r.id == room_id) {
+                            rooms_lock.push(Room {
+                                id: room_id.clone(),
+                                name: format!("Invited room {}", &room_id[..8.min(room_id.len())]),
+                                created_at: Utc::now(),
+                            });
+                        }
+                    }
+
+                    {
+                        let mut current_room_lock = state_arc.current_room.lock().await;
+                        *current_room_lock = Some(room_id.clone());
+                    }
+
+                    {
+                        let network_lock = state_arc.p2p_network.lock().await;
+                        if let Some(network) = &*network_lock {
+                            if let Err(e) = network.join_room(room_id.clone()).await {
+                                tracing::error!("Failed to auto-join invited room {}: {}", room_id, e);
+                            }
+                        }
+                    }
+
+                    let _ = app_clone.emit("room_invitation_received", serde_json::json!({
+                        "room_id": room_id,
+                        "inviter_peer_id": inviter_peer_id,
+                        "inviter_username": inviter_username
+                    }));
+                }
+                p2p_network::P2PEvent::PeerSubscribed { peer_id: peer_id_str } => {
+                    // Gossipsub has confirmed the peer is subscribed to the chat topic.
+                    // This is the right moment to send the key exchange \u2014 no more InsufficientPeers.
+                    let maybe_key_payload = {
+                        let crypto_lock = state_arc.message_crypto.lock().await;
+                        if let Some(crypto) = &*crypto_lock {
+                            if crypto.get_peer_identities().contains_key(&peer_id_str) {
+                                None // Already have their key; KeyExchangeReceived will handle the reply
+                            } else {
+                                let identity = crypto.get_identity();
+                                Some((
+                                    hex::encode(identity.public_key),
+                                    identity.key_fingerprint.clone(),
+                                ))
+                            }
+                        } else {
+                            None
+                        }
+                    };
+
+                    if let Some((public_key_hex, key_fingerprint)) = maybe_key_payload {
+                        let network_lock = state_arc.p2p_network.lock().await;
+                        if let Some(network) = &*network_lock {
+                            if let Err(e) = network
+                                .send_key_exchange(public_key_hex, key_fingerprint, peer_id_str.clone())
+                                .await
+                            {
+                                tracing::error!("Failed to send key exchange to {}: {}", peer_id_str, e);
+                            } else {
+                                tracing::info!("Sent key exchange to {} (on gossipsub subscription)", peer_id_str);
+                            }
+                        }
+                    }
+                }
                 p2p_network::P2PEvent::PeerJoined { peer_id, username } => {
+                    let peer_id_str = peer_id.to_string();
                     let user = User {
-                        id: peer_id.to_string(),
+                        id: peer_id_str,
                         username: username.unwrap_or_else(|| "Anonymous".to_string()),
                         connected_at: Utc::now(),
                     };
@@ -338,69 +396,6 @@ async fn get_our_identity(state: State<'_, AppState>) -> Result<serde_json::Valu
 }
 
 #[tauri::command]
-async fn get_peer_identities(state: State<'_, AppState>) -> Result<Vec<PeerInfo>, String> {
-    let crypto_lock = state.message_crypto.lock().await;
-    if let Some(crypto) = &*crypto_lock {
-        let peer_identities = crypto.get_peer_identities();
-        let peers: Vec<PeerInfo> = peer_identities.iter().map(|(peer_id, identity)| {
-            PeerInfo {
-                id: peer_id.clone(),
-                username: "Unknown".to_string(), // TODO: Store usernames
-                public_key: identity.public_key,
-                key_fingerprint: identity.key_fingerprint.clone(),
-                connected_at: Utc::now(), // TODO: Store actual connection time
-                verified: false, // TODO: Implement verification tracking
-            }
-        }).collect();
-        Ok(peers)
-    } else {
-        Err("Encryption not initialized".to_string())
-    }
-}
-
-#[tauri::command]
-async fn add_peer_key(
-    peer_id: String,
-    public_key_hex: String,
-    state: State<'_, AppState>,
-) -> Result<String, String> {
-    let public_key_bytes = hex::decode(&public_key_hex)
-        .map_err(|e| format!("Invalid public key hex: {}", e))?;
-    
-    if public_key_bytes.len() != 32 {
-        return Err("Public key must be 32 bytes".to_string());
-    }
-
-    let mut key_array = [0u8; 32];
-    key_array.copy_from_slice(&public_key_bytes);
-
-    let peer_identity = CryptoIdentity::from_public_key(key_array);
-    
-    let mut crypto_lock = state.message_crypto.lock().await;
-    if let Some(crypto) = &mut *crypto_lock {
-        crypto.add_peer_key(&peer_id, peer_identity.clone())
-            .map_err(|e| format!("Failed to add peer key: {}", e))?;
-        Ok(format!("Added peer key for {} (fingerprint: {})", peer_id, peer_identity.key_fingerprint))
-    } else {
-        Err("Encryption not initialized".to_string())
-    }
-}
-
-#[tauri::command]
-async fn verify_peer_fingerprint(
-    peer_id: String,
-    expected_fingerprint: String,
-    state: State<'_, AppState>,
-) -> Result<bool, String> {
-    let crypto_lock = state.message_crypto.lock().await;
-    if let Some(crypto) = &*crypto_lock {
-        Ok(crypto.verify_peer_fingerprint(&peer_id, &expected_fingerprint))
-    } else {
-        Err("Encryption not initialized".to_string())
-    }
-}
-
-#[tauri::command]
 async fn toggle_encryption(
     enabled: bool,
     state: State<'_, AppState>,
@@ -432,20 +427,13 @@ async fn invite_to_room(
 ) -> Result<(), String> {
     let p2p_lock = state.p2p_network.lock().await;
     if let Some(network) = &*p2p_lock {
-        // Convert string peer_id to PeerId
-        let peer_id_parsed = peer_id.parse::<libp2p::PeerId>()
+        // Validate peer id format before sending invitation.
+        let _ = peer_id.parse::<libp2p::PeerId>()
             .map_err(|e| format!("Invalid peer ID: {}", e))?;
-        
-        network.invite_to_room(peer_id_parsed, room_id.clone()).await
+
+        network.invite_to_room(peer_id.clone(), room_id.clone()).await
             .map_err(|e| format!("Failed to invite peer to room: {}", e))?;
-        
-        // Send room information to the peer via gossipsub
-        let _invitation_message = serde_json::json!({
-            "type": "room_invitation",
-            "room_id": room_id,
-            "inviter": network.get_peer_id().to_string()
-        });
-        
+
         // Emit success to frontend
         app.emit("peer_invited", serde_json::json!({
             "peer_id": peer_id,
@@ -456,67 +444,6 @@ async fn invite_to_room(
         Ok(())
     } else {
         Err("P2P network not initialized".to_string())
-    }
-}
-
-#[tauri::command]
-async fn auto_share_keys_with_peer(
-    peer_id: String,
-    state: State<'_, AppState>,
-    app: AppHandle,
-) -> Result<String, String> {
-    let crypto_lock = state.message_crypto.lock().await;
-    if let Some(crypto) = &*crypto_lock {
-        // Check if we already have a key for this peer
-        if crypto.get_peer_identities().contains_key(&peer_id) {
-            return Ok(format!("Key already exchanged with peer: {}", peer_id));
-        }
-        
-        let our_identity = crypto.get_identity();
-        let _key_exchange = crypto.create_key_exchange(&peer_id, "Auto-shared");
-        
-        let public_key_hex = hex::encode(our_identity.public_key);
-        
-        // Actually send the key via P2P network
-        let network_lock = state.p2p_network.lock().await;
-        if let Some(network) = &*network_lock {
-            network
-                .send_key_exchange(public_key_hex.clone(), our_identity.key_fingerprint.clone(), peer_id.clone())
-                .await
-                .map_err(|e| format!("Failed to send key exchange: {}", e))?;
-        } else {
-            return Err("P2P network not initialized".to_string());
-        }
-        
-        // Still emit event to frontend for UI feedback
-        app.emit("key_exchange_sent", serde_json::json!({
-            "peer_id": peer_id,
-            "public_key": public_key_hex,
-            "key_fingerprint": our_identity.key_fingerprint
-        }))
-        .map_err(|e| format!("Failed to emit key exchange: {}", e))?;
-        
-        Ok(format!("Key sent to peer: {}", peer_id))
-    } else {
-        Err("Encryption not initialized".to_string())
-    }
-}
-
-#[tauri::command]
-async fn get_peer_public_key(
-    peer_id: String,
-    state: State<'_, AppState>,
-) -> Result<Option<String>, String> {
-    let crypto_lock = state.message_crypto.lock().await;
-    if let Some(crypto) = &*crypto_lock {
-        let peer_identities = crypto.get_peer_identities();
-        if let Some(identity) = peer_identities.get(&peer_id) {
-            Ok(Some(hex::encode(identity.public_key)))
-        } else {
-            Ok(None)
-        }
-    } else {
-        Err("Encryption not initialized".to_string())
     }
 }
 
@@ -614,10 +541,9 @@ async fn send_p2p_message(
                         return Err("Failed to encrypt message for any peer".to_string());
                     }
                 } else {
-                    // No peer keys available, send as plaintext with warning
-                    tracing::warn!("Encryption enabled but no peer keys available, sending as plaintext");
-                    network.send_message_to_room(content.clone(), username.clone(), room_id.clone()).await
-                        .map_err(|e| format!("Failed to send P2P message: {}", e))?;
+                    // No peer keys available — refuse to send as plaintext
+                    tracing::warn!("Encryption enabled but no peer keys available, refusing to send plaintext");
+                    return Err("Keys not yet exchanged with any peer. Please wait a moment and try again.".to_string());
                 }
             } else {
                 return Err("P2P network not initialized".to_string());
@@ -1152,13 +1078,8 @@ pub fn run() {
             invite_to_room,
             // E2EE Commands
             get_our_identity,
-            get_peer_identities,
-            add_peer_key,
-            verify_peer_fingerprint,
             toggle_encryption,
             is_encryption_enabled,
-            auto_share_keys_with_peer,
-            get_peer_public_key,
             // WireGuard commands
             check_wireguard_deps,
             setup_wireguard,

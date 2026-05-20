@@ -33,6 +33,7 @@ pub enum P2PCommand {
     SendMessage { content: String, username: String },
     SendMessageToRoom { content: String, username: String, room_id: String },
     SendKeyExchange { public_key: String, key_fingerprint: String, peer_id: String },
+    SendRoomInvitation { target_peer_id: String, room_id: String, inviter_username: String },
     JoinRoom { room_id: String },
     LeaveRoom { room_id: String },
     UpdateUsername { username: String },
@@ -46,9 +47,11 @@ pub enum P2PCommand {
 pub enum P2PEvent {
     MessageReceived(Message),
     KeyExchangeReceived { peer_id: String, public_key: String, key_fingerprint: String },
+    RoomInvitationReceived { room_id: String, inviter_peer_id: String, inviter_username: String },
     PeerJoined { peer_id: PeerId, username: Option<String> },
     PeerLeft { peer_id: PeerId, username: String },
     PeerListUpdated { peers: Vec<User> },
+    PeerSubscribed { peer_id: String },
 }
 
 impl P2PNetwork {
@@ -198,6 +201,23 @@ impl P2PNetwork {
                                 tracing::info!("Sent key exchange to peer: {}", peer_id);
                             }
                         }
+                        Some(P2PCommand::SendRoomInvitation { target_peer_id, room_id, inviter_username }) => {
+                            let invitation = serde_json::json!({
+                                "type": "room_invitation",
+                                "target_peer_id": target_peer_id,
+                                "room_id": room_id,
+                                "inviter_peer_id": swarm.local_peer_id().to_string(),
+                                "inviter_username": inviter_username,
+                                "timestamp": chrono::Utc::now().to_rfc3339()
+                            });
+
+                            let invitation_json = serde_json::to_string(&invitation)
+                                .expect("Failed to serialize room invitation");
+
+                            if let Err(e) = swarm.behaviour_mut().gossipsub.publish(default_topic.clone(), invitation_json.as_bytes()) {
+                                tracing::error!("Failed to publish room invitation: {}", e);
+                            }
+                        }
                         Some(P2PCommand::JoinRoom { room_id }) => {
                             if !subscribed_rooms.contains(&room_id) {
                                 let room_topic = gossipsub::IdentTopic::new(format!("wiretalk-room-{}", room_id));
@@ -288,6 +308,30 @@ impl P2PNetwork {
                                 }
                                 return; // Don't process as regular message
                             }
+
+                            if key_exchange.get("type").and_then(|t| t.as_str()) == Some("room_invitation") {
+                                if let (Some(target_peer_id), Some(room_id), Some(inviter_peer_id), Some(inviter_username)) = (
+                                    key_exchange.get("target_peer_id").and_then(|p| p.as_str()),
+                                    key_exchange.get("room_id").and_then(|r| r.as_str()),
+                                    key_exchange.get("inviter_peer_id").and_then(|i| i.as_str()),
+                                    key_exchange.get("inviter_username").and_then(|u| u.as_str())
+                                ) {
+                                    let local_peer_id = swarm.local_peer_id().to_string();
+                                    if target_peer_id == local_peer_id {
+                                        tracing::info!(
+                                            "Received room invitation from {} to join room {}",
+                                            inviter_peer_id,
+                                            room_id
+                                        );
+                                        let _ = event_sender.send(P2PEvent::RoomInvitationReceived {
+                                            room_id: room_id.to_string(),
+                                            inviter_peer_id: inviter_peer_id.to_string(),
+                                            inviter_username: inviter_username.to_string(),
+                                        });
+                                    }
+                                }
+                                return; // Don't process as regular message
+                            }
                         }
                         
                         // Try to parse as regular chat message
@@ -340,6 +384,14 @@ impl P2PNetwork {
                             let peers: Vec<User> = connected_peers.values().cloned().collect();
                             let _ = event_sender.send(P2PEvent::PeerListUpdated { peers });
                         }
+                    }
+                }
+                P2PNetworkBehaviourEvent::Gossipsub(gossipsub::Event::Subscribed { peer_id, topic }) => {
+                    // Peer has subscribed to a gossipsub topic — they can now receive messages.
+                    // If it's the main chat topic, emit PeerSubscribed so lib.rs can send the key exchange.
+                    if topic.as_str() == "wiretalk-chat" {
+                        tracing::info!("Peer {} subscribed to wiretalk-chat topic", peer_id);
+                        let _ = event_sender.send(P2PEvent::PeerSubscribed { peer_id: peer_id.to_string() });
                     }
                 }
                 _ => {}
@@ -424,11 +476,14 @@ impl P2PNetwork {
             .map_err(|e| anyhow::anyhow!("Failed to send leave room command: {}", e))
     }
 
-    pub async fn invite_to_room(&self, peer_id: PeerId, room_id: String) -> Result<()> {
-        // In a real implementation, you would send a direct message to the peer with the room invitation
-        // For simplicity, we will just log this action
-        tracing::info!("Inviting peer {} to room {}", peer_id, room_id);
-        Ok(())
+    pub async fn invite_to_room(&self, peer_id: String, room_id: String) -> Result<()> {
+        self.message_sender
+            .send(P2PCommand::SendRoomInvitation {
+                target_peer_id: peer_id,
+                room_id,
+                inviter_username: self.username.clone(),
+            })
+            .map_err(|e| anyhow::anyhow!("Failed to send room invitation command: {}", e))
     }
 
     pub async fn update_username(&self, username: String) -> Result<()> {
