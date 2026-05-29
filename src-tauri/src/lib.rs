@@ -1,19 +1,30 @@
 use std::sync::Arc;
+use std::path::PathBuf;
 use tauri::{AppHandle, Emitter, State};
 use tokio::sync::Mutex;
 use serde::{Deserialize, Serialize};
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 use anyhow::Result;
+use base64::Engine as _;
+use aes_gcm::aead::{AeadCore, KeyInit};
 
 
 
 mod p2p_network;
 mod encryption;
 mod wireguard;
+mod secure_storage;
 use p2p_network::P2PNetwork;
 use encryption::{MessageCrypto, CryptoIdentity, KeyExchangeMessage};
 use wireguard::{WireGuardManager, WireGuardConfig, ShareablePeerConfig};
+use secure_storage::{
+    decrypt_payload,
+    encrypt_payload_with_salt,
+    read_file as read_encrypted_file,
+    resolve_storage_path,
+    write_file as write_encrypted_file,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {
@@ -23,6 +34,16 @@ pub struct Message {
     pub timestamp: DateTime<Utc>,
     pub room_id: String,
     pub encrypted: bool, // Whether this message is encrypted
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeerInfo {
+    pub id: String,
+    pub username: String,
+    pub public_key: [u8; 32],
+    pub key_fingerprint: String,
+    pub connected_at: DateTime<Utc>,
+    pub verified: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -39,6 +60,48 @@ pub struct User {
     pub connected_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StoredUser {
+    pub id: String,
+    pub username: String,
+    pub last_seen: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StoredPeerKey {
+    pub peer_id: String,
+    pub public_key_hex: String,
+    pub key_fingerprint: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SecureVaultData {
+    pub messages: Vec<Message>,
+    pub joined_rooms: Vec<Room>,
+    pub current_room: Option<String>,
+    pub current_username: Option<String>,
+    pub known_users: Vec<StoredUser>,
+    pub encryption_enabled: bool,
+    pub private_key_hex: Option<String>,
+    pub peer_keys: Vec<StoredPeerKey>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StorageStatus {
+    pub initialized: bool,
+    pub unlocked: bool,
+    pub file_exists: bool,
+    pub file_path: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SecureStorageState {
+    pub file_path: Option<PathBuf>,
+    pub unlocked: bool,
+    pub key: Option<[u8; 32]>,
+    pub salt: Option<[u8; 16]>,
+}
+
 #[derive(Debug, Clone)]
 pub struct AppState {
     pub p2p_network: Arc<Mutex<Option<P2PNetwork>>>,
@@ -46,10 +109,12 @@ pub struct AppState {
     pub current_username: Arc<Mutex<Option<String>>>,
     pub joined_rooms: Arc<Mutex<Vec<Room>>>,
     pub current_room: Arc<Mutex<Option<String>>>,
+    pub known_users: Arc<Mutex<Vec<StoredUser>>>,
     pub message_crypto: Arc<Mutex<Option<MessageCrypto>>>,
     pub pending_key_exchanges: Arc<Mutex<Vec<KeyExchangeMessage>>>,
     pub encryption_enabled: Arc<Mutex<bool>>,
     pub wireguard: Arc<Mutex<WireGuardManager>>,
+    pub secure_storage: Arc<Mutex<SecureStorageState>>,
 }
 
 impl AppState {
@@ -60,12 +125,291 @@ impl AppState {
             current_username: Arc::new(Mutex::new(None)),
             joined_rooms: Arc::new(Mutex::new(Vec::new())),
             current_room: Arc::new(Mutex::new(None)),
+            known_users: Arc::new(Mutex::new(Vec::new())),
             message_crypto: Arc::new(Mutex::new(None)),
             pending_key_exchanges: Arc::new(Mutex::new(Vec::new())),
             encryption_enabled: Arc::new(Mutex::new(true)), // E2EE enabled by default
             wireguard: Arc::new(Mutex::new(WireGuardManager::new())),
+            secure_storage: Arc::new(Mutex::new(SecureStorageState {
+                file_path: None,
+                unlocked: false,
+                key: None,
+                salt: None,
+            })),
         }
     }
+}
+
+async fn upsert_known_user(state: &AppState, id: String, username: String) {
+    let mut users = state.known_users.lock().await;
+    if let Some(existing) = users.iter_mut().find(|u| u.id == id) {
+        existing.username = username;
+        existing.last_seen = Utc::now();
+    } else {
+        users.push(StoredUser {
+            id,
+            username,
+            last_seen: Utc::now(),
+        });
+    }
+}
+
+async fn build_vault_data(state: &AppState) -> SecureVaultData {
+    let messages = state.messages.lock().await.clone();
+    let joined_rooms = state.joined_rooms.lock().await.clone();
+    let current_room = state.current_room.lock().await.clone();
+    let current_username = state.current_username.lock().await.clone();
+    let known_users = state.known_users.lock().await.clone();
+    let encryption_enabled = *state.encryption_enabled.lock().await;
+
+    let (private_key_hex, peer_keys) = {
+        let crypto_lock = state.message_crypto.lock().await;
+        if let Some(crypto) = &*crypto_lock {
+            let private_key_hex = crypto.get_identity().get_private_bytes().map(hex::encode);
+            let peer_keys = crypto
+                .get_peer_identities()
+                .iter()
+                .map(|(peer_id, identity)| StoredPeerKey {
+                    peer_id: peer_id.clone(),
+                    public_key_hex: hex::encode(identity.public_key),
+                    key_fingerprint: identity.key_fingerprint.clone(),
+                })
+                .collect();
+            (private_key_hex, peer_keys)
+        } else {
+            (None, Vec::new())
+        }
+    };
+
+    SecureVaultData {
+        messages,
+        joined_rooms,
+        current_room,
+        current_username,
+        known_users,
+        encryption_enabled,
+        private_key_hex,
+        peer_keys,
+    }
+}
+
+async fn persist_secure_vault(state: &AppState, app: &AppHandle) -> Result<(), String> {
+    let storage = state.secure_storage.lock().await.clone();
+    if !storage.unlocked {
+        return Ok(());
+    }
+
+    let key = match storage.key {
+        Some(k) => k,
+        None => return Ok(()),
+    };
+
+    let salt = match storage.salt {
+        Some(s) => s,
+        None => return Ok(()),
+    };
+
+    let file_path = if let Some(path) = storage.file_path {
+        path
+    } else {
+        resolve_storage_path(app)?
+    };
+
+    let vault = build_vault_data(state).await;
+    let payload_json = serde_json::to_string(&vault)
+        .map_err(|e| format!("Failed to serialize vault payload: {}", e))?;
+
+    let encrypted_file = {
+        let cipher = aes_gcm::Aes256Gcm::new_from_slice(&key)
+            .map_err(|e| format!("Failed to initialize vault cipher: {}", e))?;
+        let nonce = aes_gcm::Aes256Gcm::generate_nonce(&mut aes_gcm::aead::OsRng);
+        let ciphertext = aes_gcm::aead::Aead::encrypt(&cipher, &nonce, payload_json.as_bytes())
+            .map_err(|e| format!("Failed to encrypt vault payload: {}", e))?;
+
+        secure_storage::EncryptedStorageFile {
+            version: 1,
+            salt_b64: base64::engine::general_purpose::STANDARD.encode(salt),
+            nonce_b64: base64::engine::general_purpose::STANDARD.encode(nonce),
+            ciphertext_b64: base64::engine::general_purpose::STANDARD.encode(ciphertext),
+            updated_at: Utc::now(),
+        }
+    };
+
+    write_encrypted_file(&file_path, &encrypted_file).await?;
+
+    Ok(())
+}
+
+async fn load_vault_into_state(state: &AppState, vault: SecureVaultData) -> Result<(), String> {
+    {
+        let mut messages_lock = state.messages.lock().await;
+        *messages_lock = vault.messages;
+    }
+    {
+        let mut rooms_lock = state.joined_rooms.lock().await;
+        *rooms_lock = vault.joined_rooms;
+    }
+    {
+        let mut current_room_lock = state.current_room.lock().await;
+        *current_room_lock = vault.current_room;
+    }
+    {
+        let mut username_lock = state.current_username.lock().await;
+        *username_lock = vault.current_username;
+    }
+    {
+        let mut users_lock = state.known_users.lock().await;
+        *users_lock = vault.known_users;
+    }
+    {
+        let mut encryption_enabled_lock = state.encryption_enabled.lock().await;
+        *encryption_enabled_lock = vault.encryption_enabled;
+    }
+
+    let mut crypto_opt = None;
+    if let Some(private_key_hex) = vault.private_key_hex {
+        let private_bytes = hex::decode(private_key_hex)
+            .map_err(|e| format!("Invalid stored private key encoding: {}", e))?;
+        if private_bytes.len() != 32 {
+            return Err("Stored private key has invalid length".to_string());
+        }
+
+        let mut private_array = [0u8; 32];
+        private_array.copy_from_slice(&private_bytes);
+        let mut crypto = MessageCrypto::from_private_key(private_array);
+
+        for peer_key in vault.peer_keys {
+            let peer_bytes = hex::decode(peer_key.public_key_hex)
+                .map_err(|e| format!("Invalid stored peer key encoding: {}", e))?;
+            if peer_bytes.len() != 32 {
+                continue;
+            }
+            let mut key_array = [0u8; 32];
+            key_array.copy_from_slice(&peer_bytes);
+            let peer_identity = CryptoIdentity::from_public_key(key_array);
+            let _ = crypto.add_peer_key(&peer_key.peer_id, peer_identity);
+        }
+
+        crypto_opt = Some(crypto);
+    }
+
+    if crypto_opt.is_some() {
+        let mut crypto_lock = state.message_crypto.lock().await;
+        *crypto_lock = crypto_opt;
+    }
+
+    Ok(())
+}
+
+#[tauri::command]
+async fn get_storage_status(
+    state: State<'_, AppState>,
+    app: AppHandle,
+) -> Result<StorageStatus, String> {
+    let path = resolve_storage_path(&app)?;
+    let file_exists = tokio::fs::try_exists(&path)
+        .await
+        .map_err(|e| format!("Failed checking vault file: {}", e))?;
+
+    let storage = state.secure_storage.lock().await;
+    Ok(StorageStatus {
+        initialized: storage.file_path.is_some(),
+        unlocked: storage.unlocked,
+        file_exists,
+        file_path: Some(path.to_string_lossy().to_string()),
+    })
+}
+
+#[tauri::command]
+async fn unlock_secure_storage(
+    password: String,
+    create_if_missing: bool,
+    state: State<'_, AppState>,
+    app: AppHandle,
+) -> Result<String, String> {
+    let path = resolve_storage_path(&app)?;
+    let file_exists = tokio::fs::try_exists(&path)
+        .await
+        .map_err(|e| format!("Failed checking vault file: {}", e))?;
+
+    if file_exists {
+        let encrypted_file = read_encrypted_file(&path).await?;
+        let (json_payload, key) = decrypt_payload(&encrypted_file, &password)?;
+
+        let salt_bytes = base64::engine::general_purpose::STANDARD
+            .decode(&encrypted_file.salt_b64)
+            .map_err(|e| format!("Invalid vault salt: {}", e))?;
+        if salt_bytes.len() != 16 {
+            return Err("Invalid vault salt length".to_string());
+        }
+        let mut salt = [0u8; 16];
+        salt.copy_from_slice(&salt_bytes);
+
+        let vault_data: SecureVaultData = serde_json::from_str(&json_payload)
+            .map_err(|e| format!("Failed to parse decrypted vault data: {}", e))?;
+
+        load_vault_into_state(&state, vault_data).await?;
+
+        let mut storage_lock = state.secure_storage.lock().await;
+        storage_lock.file_path = Some(path.clone());
+        storage_lock.unlocked = true;
+        storage_lock.key = Some(key);
+        storage_lock.salt = Some(salt);
+    } else {
+        if !create_if_missing {
+            return Err("No encrypted vault exists yet. Create one first.".to_string());
+        }
+
+        let vault = build_vault_data(&state).await;
+        let payload_json = serde_json::to_string(&vault)
+            .map_err(|e| format!("Failed to serialize initial vault data: {}", e))?;
+
+        let mut salt = [0u8; 16];
+        use rand::RngCore;
+        rand::rngs::OsRng.fill_bytes(&mut salt);
+
+        let (encrypted_file, key) = encrypt_payload_with_salt(&payload_json, &password, salt)?;
+        write_encrypted_file(&path, &encrypted_file).await?;
+
+        let mut storage_lock = state.secure_storage.lock().await;
+        storage_lock.file_path = Some(path.clone());
+        storage_lock.unlocked = true;
+        storage_lock.key = Some(key);
+        storage_lock.salt = Some(salt);
+    }
+
+    app.emit("storage_unlocked", true)
+        .map_err(|e| format!("Failed to emit storage unlocked event: {}", e))?;
+
+    Ok("Encrypted vault unlocked".to_string())
+}
+
+#[tauri::command]
+async fn lock_secure_storage(
+    state: State<'_, AppState>,
+    app: AppHandle,
+) -> Result<String, String> {
+    persist_secure_vault(&state, &app).await?;
+
+    {
+        let mut storage_lock = state.secure_storage.lock().await;
+        storage_lock.unlocked = false;
+        storage_lock.key = None;
+        storage_lock.salt = None;
+    }
+
+    // Remove decrypted data from memory when locking.
+    {
+        state.messages.lock().await.clear();
+        state.joined_rooms.lock().await.clear();
+        *state.current_room.lock().await = None;
+        *state.message_crypto.lock().await = None;
+    }
+
+    app.emit("storage_locked", true)
+        .map_err(|e| format!("Failed to emit storage locked event: {}", e))?;
+
+    Ok("Encrypted vault locked".to_string())
 }
 
 #[tauri::command]
@@ -75,16 +419,26 @@ async fn start_p2p_network(
     app: AppHandle,
 ) -> Result<String, String> {
     // Initialize tracing for libp2p logs
-    tracing_subscriber::fmt::init();
+    let _ = tracing_subscriber::fmt::try_init();
 
     let (network, mut event_receiver) = P2PNetwork::new(username.clone()).await
         .map_err(|e| format!("Failed to start P2P network: {}", e))?;
 
     let peer_id = network.get_peer_id();
 
-    // Initialize encryption system
-    let message_crypto = MessageCrypto::new();
-    let our_identity = message_crypto.get_identity().clone();
+    // Reuse persisted crypto identity if available, otherwise generate a new one.
+    let our_identity = {
+        let mut crypto_lock = state.message_crypto.lock().await;
+        if crypto_lock.is_none() {
+            *crypto_lock = Some(MessageCrypto::new());
+        }
+
+        crypto_lock
+            .as_ref()
+            .expect("crypto state must exist")
+            .get_identity()
+            .clone()
+    };
 
     // Store the network, username, and crypto
     {
@@ -95,10 +449,7 @@ async fn start_p2p_network(
         let mut username_lock = state.current_username.lock().await;
         *username_lock = Some(username.clone());
     }
-    {
-        let mut crypto_lock = state.message_crypto.lock().await;
-        *crypto_lock = Some(message_crypto);
-    }
+    upsert_known_user(&state, peer_id.to_string(), username.clone()).await;
 
     // Handle P2P events in a separate task
     let app_clone = app.clone();
@@ -107,7 +458,9 @@ async fn start_p2p_network(
         while let Some(event) = event_receiver.recv().await {
             match event {
                 p2p_network::P2PEvent::MessageReceived(message) => {
-                    // Check if this is an encrypted message
+                    let mut message_to_emit = message.clone();
+
+                    // Check if this is an encrypted message wrapper.
                     if let Ok(encrypted_data) = serde_json::from_str::<serde_json::Value>(&message.content) {
                         if encrypted_data.get("type").and_then(|t| t.as_str()) == Some("encrypted_message") {
                             // Ignore encrypted envelopes that target other peers.
@@ -130,85 +483,75 @@ async fn start_p2p_network(
                                 }
                             }
 
-                            // This is an encrypted message, try to decrypt it
                             let crypto_lock = state_arc.message_crypto.lock().await;
                             if let Some(crypto) = &*crypto_lock {
                                 if let (Some(encrypted_content), Some(sender)) = (
                                     encrypted_data.get("content").and_then(|c| c.as_str()),
                                     encrypted_data.get("sender").and_then(|s| s.as_str())
                                 ) {
-                                    // Parse the encrypted content as EncryptedMessage
                                     if let Ok(encrypted_msg) = serde_json::from_str::<crate::encryption::EncryptedMessage>(encrypted_content) {
                                         let mut decrypted_content = None;
-                                        
-                                        // Try using sender_peer_id first (preferred method)
+
                                         if let Some(sender_peer_id) = encrypted_data.get("sender_peer_id").and_then(|p| p.as_str()) {
                                             if let Ok(content) = crypto.decrypt_message(&encrypted_msg, sender_peer_id) {
                                                 decrypted_content = Some(content);
                                             }
                                         }
-                                        
-                                        // Fallback: try using username (for backward compatibility)
+
                                         if decrypted_content.is_none() {
                                             if let Ok(content) = crypto.decrypt_message(&encrypted_msg, &message.username) {
                                                 decrypted_content = Some(content);
                                             }
                                         }
-                                        
-                                        if let Some(content) = decrypted_content {
-                                        // Create decrypted message
-                                        let decrypted_message = Message {
+
+                                        message_to_emit = Message {
                                             id: message.id,
                                             username: sender.to_string(),
-                                            content,
+                                            content: decrypted_content.unwrap_or_else(|| {
+                                                "[ENCRYPTED MESSAGE - No shared key]".to_string()
+                                            }),
                                             timestamp: message.timestamp,
                                             room_id: message.room_id,
                                             encrypted: true,
                                         };
-                                        let _ = app_clone.emit("message_received", &decrypted_message);
                                     } else {
-                                        // Couldn't decrypt, show as encrypted
-                                        let encrypted_message = Message {
+                                        message_to_emit = Message {
                                             id: message.id,
                                             username: sender.to_string(),
-                                            content: "[ENCRYPTED MESSAGE - No shared key]".to_string(),
+                                            content: "[ENCRYPTED MESSAGE - Parse failed]".to_string(),
                                             timestamp: message.timestamp,
                                             room_id: message.room_id,
                                             encrypted: true,
                                         };
-                                        let _ = app_clone.emit("message_received", &encrypted_message);
                                     }
-                                } else {
-                                    // Failed to parse encrypted message
-                                    let encrypted_message = Message {
-                                        id: message.id.clone(),
-                                        username: sender.to_string(),
-                                        content: "[ENCRYPTED MESSAGE - Parse failed]".to_string(),
-                                        timestamp: message.timestamp,
-                                        room_id: message.room_id.clone(),
-                                        encrypted: true,
-                                    };
-                                    let _ = app_clone.emit("message_received", &encrypted_message);
                                 }
-                            }
                             } else {
-                                // No crypto available, show as encrypted
-                                let encrypted_message = Message {
-                                    id: message.id.clone(),
-                                    username: message.username.clone(),
+                                message_to_emit = Message {
+                                    id: message.id,
+                                    username: message.username,
                                     content: "[ENCRYPTED MESSAGE]".to_string(),
                                     timestamp: message.timestamp,
-                                    room_id: message.room_id.clone(),
+                                    room_id: message.room_id,
                                     encrypted: true,
                                 };
-                                let _ = app_clone.emit("message_received", &encrypted_message);
                             }
-                            continue; // Don't process as regular message
                         }
                     }
-                    
-                    // Regular message handling
-                    let _ = app_clone.emit("message_received", &message);
+
+                    {
+                        let mut messages = state_arc.messages.lock().await;
+                        messages.push(message_to_emit.clone());
+                    }
+
+                    upsert_known_user(
+                        &state_arc,
+                        message_to_emit.username.clone(),
+                        message_to_emit.username.clone(),
+                    )
+                    .await;
+
+                    let _ = persist_secure_vault(&state_arc, &app_clone).await;
+                    let _ = app_clone.emit("message_received", &message_to_emit);
                 }
                 p2p_network::P2PEvent::KeyExchangeReceived { peer_id, public_key, key_fingerprint } => {
                     // Automatically add the received public key
@@ -227,6 +570,8 @@ async fn start_p2p_network(
                                 
                                 if crypto.add_peer_key(&peer_id, peer_identity).is_ok() {
                                     tracing::info!("Automatically added key from peer: {}", peer_id);
+                                    upsert_known_user(&state_arc, peer_id.clone(), "Unknown".to_string()).await;
+                                    let _ = persist_secure_vault(&state_arc, &app_clone).await;
                                     // Emit success event to frontend
                                     let _ = app_clone.emit("key_exchange_received", serde_json::json!({
                                         "peer_id": peer_id,
@@ -351,6 +696,8 @@ async fn start_p2p_network(
                         username: username.unwrap_or_else(|| "Anonymous".to_string()),
                         connected_at: Utc::now(),
                     };
+                    upsert_known_user(&state_arc, user.id.clone(), user.username.clone()).await;
+                    let _ = persist_secure_vault(&state_arc, &app_clone).await;
                     let _ = app_clone.emit("peer_joined", &user);
                 }
                 p2p_network::P2PEvent::PeerLeft { peer_id, username } => {
@@ -359,6 +706,8 @@ async fn start_p2p_network(
                         username,
                         connected_at: Utc::now(),
                     };
+                    upsert_known_user(&state_arc, user.id.clone(), user.username.clone()).await;
+                    let _ = persist_secure_vault(&state_arc, &app_clone).await;
                     let _ = app_clone.emit("peer_left", &user);
                 }
                 p2p_network::P2PEvent::PeerListUpdated { peers } => {
@@ -375,6 +724,8 @@ async fn start_p2p_network(
         "key_fingerprint": our_identity.key_fingerprint
     }))
     .map_err(|e| format!("Failed to emit network start event: {}", e))?;
+
+    persist_secure_vault(&state, &app).await?;
 
     Ok(format!("P2P network started with peer ID: {} (E2EE enabled)", peer_id))
 }
@@ -396,6 +747,72 @@ async fn get_our_identity(state: State<'_, AppState>) -> Result<serde_json::Valu
 }
 
 #[tauri::command]
+async fn get_peer_identities(state: State<'_, AppState>) -> Result<Vec<PeerInfo>, String> {
+    let crypto_lock = state.message_crypto.lock().await;
+    if let Some(crypto) = &*crypto_lock {
+        let peer_identities = crypto.get_peer_identities();
+        let peers: Vec<PeerInfo> = peer_identities.iter().map(|(peer_id, identity)| {
+            PeerInfo {
+                id: peer_id.clone(),
+                username: "Unknown".to_string(), // TODO: Store usernames
+                public_key: identity.public_key,
+                key_fingerprint: identity.key_fingerprint.clone(),
+                connected_at: Utc::now(), // TODO: Store actual connection time
+                verified: false, // TODO: Implement verification tracking
+            }
+        }).collect();
+        Ok(peers)
+    } else {
+        Err("Encryption not initialized".to_string())
+    }
+}
+
+#[tauri::command]
+async fn add_peer_key(
+    peer_id: String,
+    public_key_hex: String,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    let public_key_bytes = hex::decode(&public_key_hex)
+        .map_err(|e| format!("Invalid public key hex: {}", e))?;
+    
+    if public_key_bytes.len() != 32 {
+        return Err("Public key must be 32 bytes".to_string());
+    }
+
+    let mut key_array = [0u8; 32];
+    key_array.copy_from_slice(&public_key_bytes);
+
+    let peer_identity = CryptoIdentity::from_public_key(key_array);
+    
+    let mut crypto_lock = state.message_crypto.lock().await;
+    if let Some(crypto) = &mut *crypto_lock {
+        crypto.add_peer_key(&peer_id, peer_identity.clone())
+            .map_err(|e| format!("Failed to add peer key: {}", e))?;
+        upsert_known_user(&state, peer_id.clone(), "Unknown".to_string()).await;
+        persist_secure_vault(&state, &app).await?;
+        Ok(format!("Added peer key for {} (fingerprint: {})", peer_id, peer_identity.key_fingerprint))
+    } else {
+        Err("Encryption not initialized".to_string())
+    }
+}
+
+#[tauri::command]
+async fn verify_peer_fingerprint(
+    peer_id: String,
+    expected_fingerprint: String,
+    state: State<'_, AppState>,
+) -> Result<bool, String> {
+    let crypto_lock = state.message_crypto.lock().await;
+    if let Some(crypto) = &*crypto_lock {
+        Ok(crypto.verify_peer_fingerprint(&peer_id, &expected_fingerprint))
+    } else {
+        Err("Encryption not initialized".to_string())
+    }
+}
+
+#[tauri::command]
 async fn toggle_encryption(
     enabled: bool,
     state: State<'_, AppState>,
@@ -408,6 +825,8 @@ async fn toggle_encryption(
     
     app.emit("encryption_toggled", enabled)
         .map_err(|e| format!("Failed to emit encryption toggle: {}", e))?;
+
+    persist_secure_vault(&state, &app).await?;
     
     Ok(())
 }
@@ -489,6 +908,7 @@ async fn send_p2p_message(
         let mut messages = state.messages.lock().await;
         messages.push(message.clone());
     }
+    upsert_known_user(&state, username.clone(), username.clone()).await;
 
     // Send message via P2P network
     if encryption_enabled {
@@ -566,6 +986,8 @@ async fn send_p2p_message(
     app.emit("message_sent", &message)
         .map_err(|e| format!("Failed to emit message: {}", e))?;
 
+    persist_secure_vault(&state, &app).await?;
+
     Ok(())
 }
 
@@ -608,6 +1030,8 @@ async fn create_room(
     
     app.emit("room_joined", &room.id)
         .map_err(|e| format!("Failed to emit room joined: {}", e))?;
+
+    persist_secure_vault(&state, &app).await?;
 
     Ok(room)
 }
@@ -654,6 +1078,8 @@ async fn join_room(
     app.emit("room_joined", &room_id)
         .map_err(|e| format!("Failed to emit room joined: {}", e))?;
 
+    persist_secure_vault(&state, &app).await?;
+
     Ok(())
 }
 
@@ -691,6 +1117,8 @@ async fn leave_room(
     // Emit to frontend
     app.emit("room_left", &room_id)
         .map_err(|e| format!("Failed to emit room left: {}", e))?;
+
+    persist_secure_vault(&state, &app).await?;
 
     Ok(())
 }
@@ -730,6 +1158,8 @@ async fn switch_room(
     // Emit to frontend
     app.emit("room_switched", &room_id)
         .map_err(|e| format!("Failed to emit room switch: {}", e))?;
+
+    persist_secure_vault(&state, &app).await?;
 
     Ok(())
 }
@@ -774,6 +1204,9 @@ async fn update_username(
     // Emit to frontend
     app.emit("username_updated", &new_username)
         .map_err(|e| format!("Failed to emit username update: {}", e))?;
+
+    upsert_known_user(&state, new_username.clone(), new_username).await;
+    persist_secure_vault(&state, &app).await?;
 
     Ok(())
 }
@@ -1069,6 +1502,9 @@ pub fn run() {
             update_username,
             get_network_status,
             get_connected_peers,
+            get_storage_status,
+            unlock_secure_storage,
+            lock_secure_storage,
             create_room,
             join_room,
             leave_room,

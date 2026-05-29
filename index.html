@@ -36,6 +36,24 @@
               <code id="peer-id-display"></code>
             </div>
           </div>
+
+          <div class="storage-section" id="storage-section">
+            <h3>Secure Local Vault</h3>
+            <p class="help-text">Messages, users, and keys are encrypted at rest.</p>
+            <div class="form-group">
+              <input
+                id="storage-password-input"
+                type="password"
+                placeholder="Enter password/PIN"
+                maxlength="128"
+              />
+              <button id="unlock-storage-btn" type="button">Unlock / Create Vault</button>
+            </div>
+            <div class="storage-actions">
+              <button id="lock-storage-btn" type="button" class="small-btn" disabled>Lock Vault</button>
+              <span id="storage-status-text">Vault locked</span>
+            </div>
+          </div>
           
           <div class="rooms-section" style="display: none;" id="rooms-section">
             <h3>Chat Rooms</h3>

@@ -41,6 +41,13 @@ interface RoomInvitationPayload {
   inviter_username: string;
 }
 
+interface StorageStatus {
+  initialized: boolean;
+  unlocked: boolean;
+  file_exists: boolean;
+  file_path?: string;
+}
+
 class P2PChatApp {
   private username: string = "";
   private connected: boolean = false;
@@ -51,6 +58,7 @@ class P2PChatApp {
   private encryptionEnabled: boolean = true;
   private ourFingerprint: string = "";
   private wgActive: boolean = false;
+  private storageUnlocked: boolean = false;
 
   // DOM elements
   private usernameInput!: HTMLInputElement;
@@ -65,6 +73,11 @@ class P2PChatApp {
   private messageForm!: HTMLFormElement;
   private peerInfo!: HTMLElement;
   private peerIdDisplay!: HTMLElement;
+  private storageSection!: HTMLElement;
+  private storagePasswordInput!: HTMLInputElement;
+  private unlockStorageBtn!: HTMLButtonElement;
+  private lockStorageBtn!: HTMLButtonElement;
+  private storageStatusText!: HTMLElement;
   
   // Room-related DOM elements
   private roomsSection!: HTMLElement;
@@ -113,6 +126,8 @@ class P2PChatApp {
     this.setupEventListeners();
     this.setupTauriEventListeners();
     this.cleanupStaleWireGuardOnStartup();
+    this.checkStorageStatus();
+    this.cleanupStaleWireGuardOnStartup();
     this.checkNetworkStatus();
   }
 
@@ -129,6 +144,11 @@ class P2PChatApp {
     this.messageForm = document.getElementById("message-form") as HTMLFormElement;
     this.peerInfo = document.getElementById("peer-info")!;
     this.peerIdDisplay = document.getElementById("peer-id-display")!;
+    this.storageSection = document.getElementById("storage-section")!;
+    this.storagePasswordInput = document.getElementById("storage-password-input") as HTMLInputElement;
+    this.unlockStorageBtn = document.getElementById("unlock-storage-btn") as HTMLButtonElement;
+    this.lockStorageBtn = document.getElementById("lock-storage-btn") as HTMLButtonElement;
+    this.storageStatusText = document.getElementById("storage-status-text")!;
     
     // Room-related elements
     this.roomsSection = document.getElementById("rooms-section")!;
@@ -177,6 +197,8 @@ class P2PChatApp {
   private setupEventListeners(): void {
     this.setUsernameBtn.addEventListener("click", () => this.setUsername());
     this.messageForm.addEventListener("submit", (e) => this.sendMessage(e));
+    this.unlockStorageBtn.addEventListener("click", () => this.unlockStorage());
+    this.lockStorageBtn.addEventListener("click", () => this.lockStorage());
     
     this.usernameInput.addEventListener("keypress", (e) => {
       if (e.key === "Enter") this.setUsername();
@@ -212,6 +234,10 @@ class P2PChatApp {
     // E2EE event listeners
     this.encryptionToggle.addEventListener("change", () => this.toggleEncryption());
     this.copyFingerprintBtn.addEventListener("click", () => this.copyOurFingerprint());
+
+    this.storagePasswordInput.addEventListener("keypress", (e) => {
+      if (e.key === "Enter") this.unlockStorage();
+    });
 
     // WireGuard event listeners
     this.wgSetupBtn.addEventListener("click", () => this.setupWireGuard());
@@ -252,6 +278,17 @@ class P2PChatApp {
       this.updateEncryptionStatus();
       const status = this.encryptionEnabled ? "enabled" : "disabled";
       this.addSystemMessage(`End-to-end encryption ${status}`);
+    });
+
+    await listen<boolean>("storage_unlocked", () => {
+      this.storageUnlocked = true;
+      this.updateStorageStatusText(true);
+    });
+
+    await listen<boolean>("storage_locked", () => {
+      this.storageUnlocked = false;
+      this.updateStorageStatusText(false);
+      this.clearMessages();
     });
 
     await listen<Message>("message_sent", (event) => {
@@ -366,6 +403,83 @@ class P2PChatApp {
     }
   }
 
+  private async checkStorageStatus(): Promise<void> {
+    try {
+      const status = await invoke<StorageStatus>("get_storage_status");
+      this.storageUnlocked = status.unlocked;
+      this.updateStorageStatusText(status.unlocked);
+
+      if (status.unlocked) {
+        this.addSystemMessage("Secure vault unlocked. Encrypted history is available.");
+        await this.updateRoomsList();
+        await this.clearAndLoadMessages();
+      } else if (status.file_exists) {
+        this.addSystemMessage("Encrypted vault detected. Enter password/PIN to unlock history.");
+      } else {
+        this.addSystemMessage("No vault found. Set a password/PIN to create one.");
+      }
+    } catch (error) {
+      console.error("Failed to check storage status:", error);
+      this.updateStorageStatusText(false);
+    }
+  }
+
+  private updateStorageStatusText(unlocked: boolean): void {
+    this.storageStatusText.textContent = unlocked ? "Vault unlocked" : "Vault locked";
+    this.lockStorageBtn.disabled = !unlocked;
+    this.unlockStorageBtn.disabled = unlocked;
+    this.storagePasswordInput.disabled = unlocked;
+    this.storageSection.classList.toggle("vault-unlocked", unlocked);
+  }
+
+  private async unlockStorage(): Promise<void> {
+    const password = this.storagePasswordInput.value.trim();
+    if (!password) {
+      alert("Please enter a password/PIN");
+      return;
+    }
+
+    try {
+      await invoke<string>("unlock_secure_storage", {
+        password,
+        createIfMissing: true,
+        // Compatibility fallback for command argument decoding.
+        create_if_missing: true,
+      });
+
+      this.storageUnlocked = true;
+      this.updateStorageStatusText(true);
+      this.storagePasswordInput.value = "";
+      this.addSystemMessage("Secure vault unlocked");
+
+      await this.updateRoomsList();
+      await this.clearAndLoadMessages();
+    } catch (error) {
+      console.error("Failed to unlock secure vault:", error);
+      const message = typeof error === "string"
+        ? error
+        : (error && typeof error === "object" && "message" in error)
+          ? String((error as { message?: unknown }).message)
+          : JSON.stringify(error);
+      alert(`Failed to unlock secure vault: ${message}`);
+      this.storageUnlocked = false;
+      this.updateStorageStatusText(false);
+    }
+  }
+
+  private async lockStorage(): Promise<void> {
+    try {
+      await invoke<string>("lock_secure_storage");
+      this.storageUnlocked = false;
+      this.updateStorageStatusText(false);
+      this.addSystemMessage("Secure vault locked");
+      this.clearMessages();
+    } catch (error) {
+      console.error("Failed to lock secure vault:", error);
+      this.addSystemMessage("Failed to lock secure vault");
+    }
+  }
+
   private setUsername(): void {
     const username = this.usernameInput.value.trim();
     if (!username) {
@@ -414,6 +528,12 @@ class P2PChatApp {
 
     this.ensureUsernameReady();
     this.joiningNetwork = true;
+
+    if (!this.storageUnlocked) {
+      alert("Unlock the secure local vault first.");
+      this.joiningNetwork = false;
+      return;
+    }
 
     this.updateConnectionStatus("connecting", "Joining P2P network...");
 
