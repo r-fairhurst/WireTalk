@@ -39,16 +39,6 @@ pub struct Message {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PeerInfo {
-    pub id: String,
-    pub username: String,
-    pub public_key: [u8; 32],
-    pub key_fingerprint: String,
-    pub connected_at: DateTime<Utc>,
-    pub verified: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Room {
     pub id: String,
     pub name: String,
@@ -776,72 +766,6 @@ async fn get_our_identity(state: State<'_, AppState>) -> Result<serde_json::Valu
             "public_key": hex::encode(identity.public_key),
             "key_fingerprint": identity.key_fingerprint
         }))
-    } else {
-        Err("Encryption not initialized".to_string())
-    }
-}
-
-#[tauri::command]
-async fn get_peer_identities(state: State<'_, AppState>) -> Result<Vec<PeerInfo>, String> {
-    let crypto_lock = state.message_crypto.lock().await;
-    if let Some(crypto) = &*crypto_lock {
-        let peer_identities = crypto.get_peer_identities();
-        let peers: Vec<PeerInfo> = peer_identities.iter().map(|(peer_id, identity)| {
-            PeerInfo {
-                id: peer_id.clone(),
-                username: "Unknown".to_string(), // TODO: Store usernames
-                public_key: identity.public_key,
-                key_fingerprint: identity.key_fingerprint.clone(),
-                connected_at: Utc::now(), // TODO: Store actual connection time
-                verified: false, // TODO: Implement verification tracking
-            }
-        }).collect();
-        Ok(peers)
-    } else {
-        Err("Encryption not initialized".to_string())
-    }
-}
-
-#[tauri::command]
-async fn add_peer_key(
-    peer_id: String,
-    public_key_hex: String,
-    app: AppHandle,
-    state: State<'_, AppState>,
-) -> Result<String, String> {
-    let public_key_bytes = hex::decode(&public_key_hex)
-        .map_err(|e| format!("Invalid public key hex: {}", e))?;
-    
-    if public_key_bytes.len() != 32 {
-        return Err("Public key must be 32 bytes".to_string());
-    }
-
-    let mut key_array = [0u8; 32];
-    key_array.copy_from_slice(&public_key_bytes);
-
-    let peer_identity = CryptoIdentity::from_public_key(key_array);
-    
-    let mut crypto_lock = state.message_crypto.lock().await;
-    if let Some(crypto) = &mut *crypto_lock {
-        crypto.add_peer_key(&peer_id, peer_identity.clone())
-            .map_err(|e| format!("Failed to add peer key: {}", e))?;
-        upsert_known_user(&state, peer_id.clone(), "Unknown".to_string()).await;
-        persist_secure_vault(&state, &app).await?;
-        Ok(format!("Added peer key for {} (fingerprint: {})", peer_id, peer_identity.key_fingerprint))
-    } else {
-        Err("Encryption not initialized".to_string())
-    }
-}
-
-#[tauri::command]
-async fn verify_peer_fingerprint(
-    peer_id: String,
-    expected_fingerprint: String,
-    state: State<'_, AppState>,
-) -> Result<bool, String> {
-    let crypto_lock = state.message_crypto.lock().await;
-    if let Some(crypto) = &*crypto_lock {
-        Ok(crypto.verify_peer_fingerprint(&peer_id, &expected_fingerprint))
     } else {
         Err("Encryption not initialized".to_string())
     }
