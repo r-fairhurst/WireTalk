@@ -55,7 +55,7 @@ pub enum P2PEvent {
 }
 
 impl P2PNetwork {
-    pub async fn new(username: String) -> Result<(Self, mpsc::UnboundedReceiver<P2PEvent>)> {
+    pub async fn new(username: String, allow_lan: bool) -> Result<(Self, mpsc::UnboundedReceiver<P2PEvent>)> {
         let (command_sender, command_receiver) = mpsc::unbounded_channel();
         let (event_sender, event_receiver) = mpsc::unbounded_channel();
 
@@ -110,8 +110,13 @@ impl P2PNetwork {
             .with_swarm_config(|cfg| cfg.with_idle_connection_timeout(Duration::from_secs(60)))
             .build();
 
-        // Listen on all interfaces
-        swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse()?)?;
+        // Security-first default: bind to loopback unless LAN exposure is explicitly enabled.
+        let listen_addr = if allow_lan {
+            "/ip4/0.0.0.0/tcp/0"
+        } else {
+            "/ip4/127.0.0.1/tcp/0"
+        };
+        swarm.listen_on(listen_addr.parse()?)?;
 
         // Subscribe to the main chat topic
         let topic = gossipsub::IdentTopic::new("wiretalk-chat");
@@ -285,10 +290,13 @@ impl P2PNetwork {
         match event {
             SwarmEvent::Behaviour(event) => match event {
                 P2PNetworkBehaviourEvent::Gossipsub(gossipsub::Event::Message {
-                    propagation_source: _,
+                    propagation_source,
                     message_id: _,
                     message,
                 }) => {
+                    // Use the authenticated sender identity from libp2p metadata instead of trusting JSON payload fields.
+                    let authenticated_source = message.source.unwrap_or(propagation_source);
+
                     // Handle incoming messages
                     if let Ok(message_str) = String::from_utf8(message.data.clone()) {
                         // Try to parse as key exchange first
@@ -299,9 +307,19 @@ impl P2PNetwork {
                                     key_exchange.get("public_key").and_then(|k| k.as_str()),
                                     key_exchange.get("key_fingerprint").and_then(|f| f.as_str())
                                 ) {
-                                    tracing::info!("Received key exchange from peer: {}", peer_id);
+                                    let authenticated_peer_id = authenticated_source.to_string();
+                                    if peer_id != authenticated_peer_id {
+                                        tracing::warn!(
+                                            "Rejected spoofed key exchange: payload peer_id {} does not match authenticated source {}",
+                                            peer_id,
+                                            authenticated_peer_id
+                                        );
+                                        return;
+                                    }
+
+                                    tracing::info!("Received key exchange from peer: {}", authenticated_peer_id);
                                     let _ = event_sender.send(P2PEvent::KeyExchangeReceived {
-                                        peer_id: peer_id.to_string(),
+                                        peer_id: authenticated_peer_id,
                                         public_key: public_key.to_string(),
                                         key_fingerprint: key_fingerprint.to_string(),
                                     });
@@ -316,16 +334,26 @@ impl P2PNetwork {
                                     key_exchange.get("inviter_peer_id").and_then(|i| i.as_str()),
                                     key_exchange.get("inviter_username").and_then(|u| u.as_str())
                                 ) {
+                                    let authenticated_peer_id = authenticated_source.to_string();
+                                    if inviter_peer_id != authenticated_peer_id {
+                                        tracing::warn!(
+                                            "Rejected spoofed room invitation: payload inviter {} does not match authenticated source {}",
+                                            inviter_peer_id,
+                                            authenticated_peer_id
+                                        );
+                                        return;
+                                    }
+
                                     let local_peer_id = swarm.local_peer_id().to_string();
                                     if target_peer_id == local_peer_id {
                                         tracing::info!(
                                             "Received room invitation from {} to join room {}",
-                                            inviter_peer_id,
+                                            authenticated_peer_id,
                                             room_id
                                         );
                                         let _ = event_sender.send(P2PEvent::RoomInvitationReceived {
                                             room_id: room_id.to_string(),
-                                            inviter_peer_id: inviter_peer_id.to_string(),
+                                            inviter_peer_id: authenticated_peer_id,
                                             inviter_username: inviter_username.to_string(),
                                         });
                                     }

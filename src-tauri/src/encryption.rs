@@ -90,7 +90,7 @@ impl CryptoIdentity {
         let mut hasher = Sha256::new();
         hasher.update(public_key.as_bytes());
         let result = hasher.finalize();
-        hex::encode(result)[..16].to_string().to_uppercase() // First 16 chars for display
+        hex::encode(result).to_uppercase()
     }
 
     /// Get the public key as X25519 PublicKey object

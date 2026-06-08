@@ -1,11 +1,13 @@
 use std::fs;
 use std::io::Write;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 pub const INTERFACE_NAME: &str = "wiretalk-wg";
 pub const DEFAULT_LISTEN_PORT: u16 = 51820;
@@ -53,7 +55,7 @@ pub struct WireGuardManager {
 
 impl WireGuardManager {
     pub fn new() -> Self {
-        let config_path = std::env::temp_dir().join("wiretalk-wg.conf");
+        let config_path = std::env::temp_dir().join(format!("wiretalk-wg-{}.conf", Uuid::new_v4()));
         Self {
             config: None,
             config_path,
@@ -131,6 +133,11 @@ impl WireGuardManager {
     /// Generate keys, write the config file, and bring up the WireGuard interface.
     /// `interface_ip` should be in CIDR notation, e.g. `"10.10.10.1/24"`.
     pub fn setup(&mut self, interface_ip: String, listen_port: u16) -> Result<()> {
+        Self::validate_ipv4_cidr(&interface_ip)?;
+        if listen_port == 0 {
+            return Err(anyhow!("Listen port must be between 1 and 65535"));
+        }
+
         Self::check_dependencies()?;
 
         // Recover from stale interface state left by previous runs.
@@ -201,6 +208,11 @@ impl WireGuardManager {
         allowed_ips: String,
         endpoint: Option<String>,
     ) -> Result<()> {
+        Self::validate_ipv4_cidr(&allowed_ips)?;
+        if let Some(ep) = &endpoint {
+            Self::validate_endpoint(ep)?;
+        }
+
         // Validate the interface is up
         if !self.is_active() {
             return Err(anyhow!(
@@ -407,5 +419,35 @@ impl WireGuardManager {
 
         // Fall back to sudo
         Command::new("sudo").args(args).output()
+    }
+
+    fn validate_ipv4_cidr(cidr: &str) -> Result<()> {
+        let mut parts = cidr.split('/');
+        let ip_str = parts.next().ok_or_else(|| anyhow!("CIDR is missing IP address"))?;
+        let prefix_str = parts.next().ok_or_else(|| anyhow!("CIDR is missing prefix length"))?;
+
+        if parts.next().is_some() {
+            return Err(anyhow!("CIDR has too many '/' separators"));
+        }
+
+        ip_str
+            .parse::<Ipv4Addr>()
+            .map_err(|e| anyhow!("Invalid IPv4 address '{}': {}", ip_str, e))?;
+
+        let prefix = prefix_str
+            .parse::<u8>()
+            .map_err(|e| anyhow!("Invalid CIDR prefix '{}': {}", prefix_str, e))?;
+        if prefix > 32 {
+            return Err(anyhow!("CIDR prefix '{}' must be between 0 and 32", prefix));
+        }
+
+        Ok(())
+    }
+
+    fn validate_endpoint(endpoint: &str) -> Result<()> {
+        endpoint
+            .parse::<SocketAddr>()
+            .map_err(|e| anyhow!("Invalid endpoint '{}': expected host:port IP socket address ({})", endpoint, e))?;
+        Ok(())
     }
 }

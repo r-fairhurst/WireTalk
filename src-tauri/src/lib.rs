@@ -1,5 +1,7 @@
 use std::sync::Arc;
 use std::path::PathBuf;
+use std::collections::HashMap;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use tauri::{AppHandle, Emitter, State};
 use tokio::sync::Mutex;
 use serde::{Deserialize, Serialize};
@@ -115,6 +117,7 @@ pub struct AppState {
     pub encryption_enabled: Arc<Mutex<bool>>,
     pub wireguard: Arc<Mutex<WireGuardManager>>,
     pub secure_storage: Arc<Mutex<SecureStorageState>>,
+    pub seen_encrypted_messages: Arc<Mutex<HashMap<String, DateTime<Utc>>>>,
 }
 
 impl AppState {
@@ -136,6 +139,8 @@ impl AppState {
                 key: None,
                 salt: None,
             })),
+            seen_encrypted_messages: Arc::new(Mutex::new(HashMap::new())),
+            seen_encrypted_messages: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
@@ -415,13 +420,14 @@ async fn lock_secure_storage(
 #[tauri::command]
 async fn start_p2p_network(
     username: String,
+    allow_lan: Option<bool>,
     state: State<'_, AppState>,
     app: AppHandle,
 ) -> Result<String, String> {
     // Initialize tracing for libp2p logs
     let _ = tracing_subscriber::fmt::try_init();
 
-    let (network, mut event_receiver) = P2PNetwork::new(username.clone()).await
+    let (network, mut event_receiver) = P2PNetwork::new(username.clone(), allow_lan.unwrap_or(false)).await
         .map_err(|e| format!("Failed to start P2P network: {}", e))?;
 
     let peer_id = network.get_peer_id();
@@ -463,6 +469,23 @@ async fn start_p2p_network(
                     // Check if this is an encrypted message wrapper.
                     if let Ok(encrypted_data) = serde_json::from_str::<serde_json::Value>(&message.content) {
                         if encrypted_data.get("type").and_then(|t| t.as_str()) == Some("encrypted_message") {
+                            // Replay protection: reject duplicate encrypted envelopes by sender+message ID.
+                            if let Some(sender_peer_id) = encrypted_data.get("sender_peer_id").and_then(|p| p.as_str()) {
+                                let replay_key = format!("{}:{}", sender_peer_id, message.id);
+                                let now = Utc::now();
+                                let replay_window = chrono::Duration::minutes(30);
+
+                                let mut replay_cache = state_arc.seen_encrypted_messages.lock().await;
+                                replay_cache.retain(|_, seen_at| *seen_at > now - replay_window);
+
+                                if replay_cache.contains_key(&replay_key) {
+                                    tracing::warn!("Dropped replayed encrypted message: {}", replay_key);
+                                    continue;
+                                }
+
+                                replay_cache.insert(replay_key, now);
+                            }
+
                             // Ignore encrypted envelopes that target other peers.
                             let local_peer_id = {
                                 let network_lock = state_arc.p2p_network.lock().await;
@@ -567,6 +590,19 @@ async fn start_p2p_network(
                                 key_array.copy_from_slice(&public_key_bytes);
                                 
                                 let peer_identity = CryptoIdentity::from_public_key(key_array);
+                                if peer_identity.key_fingerprint != key_fingerprint.to_uppercase() {
+                                    tracing::warn!(
+                                        "Rejected key exchange from {} due to fingerprint mismatch",
+                                        peer_id
+                                    );
+                                    let _ = app_clone.emit("key_exchange_received", serde_json::json!({
+                                        "peer_id": peer_id,
+                                        "public_key": public_key,
+                                        "success": false,
+                                        "error": "Fingerprint mismatch"
+                                    }));
+                                    continue;
+                                }
                                 
                                 if crypto.add_peer_key(&peer_id, peer_identity).is_ok() {
                                     tracing::info!("Automatically added key from peer: {}", peer_id);
@@ -1406,17 +1442,26 @@ async fn add_wireguard_peer_from_config(
     let peer_cfg: ShareablePeerConfig = serde_json::from_str(&peer_config_json)
         .map_err(|e| format!("Invalid peer config JSON: {}", e))?;
 
+    peer_cfg
+        .tunnel_ip
+        .parse::<Ipv4Addr>()
+        .map_err(|e| format!("Invalid tunnel IPv4 address '{}': {}", peer_cfg.tunnel_ip, e))?;
+
     let allowed_ip = format!("{}/32", peer_cfg.tunnel_ip);
-    let endpoint = peer_cfg
-        .endpoint
-        .map(|ep| {
-            // If the endpoint doesn't include a port, append the peer's listen port
-            if ep.contains(':') {
-                ep
-            } else {
-                format!("{}:{}", ep, peer_cfg.listen_port)
-            }
-        });
+    let endpoint = peer_cfg.endpoint.map(|ep| {
+        if ep.parse::<SocketAddr>().is_ok() {
+            return ep;
+        }
+
+        if let Ok(ip) = ep.parse::<IpAddr>() {
+            return match ip {
+                IpAddr::V4(v4) => format!("{}:{}", v4, peer_cfg.listen_port),
+                IpAddr::V6(v6) => format!("[{}]:{}", v6, peer_cfg.listen_port),
+            };
+        }
+
+        ep
+    });
 
     let mut wg = state.wireguard.lock().await;
     wg.add_peer(peer_cfg.public_key.clone(), allowed_ip.clone(), endpoint)
