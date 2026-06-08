@@ -140,7 +140,6 @@ impl AppState {
                 salt: None,
             })),
             seen_encrypted_messages: Arc::new(Mutex::new(HashMap::new())),
-            seen_encrypted_messages: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
